@@ -12,6 +12,8 @@
 
 pub mod column;
 pub mod error;
+pub mod history;
+pub mod index;
 pub mod keys;
 pub mod osc;
 pub mod quote;
