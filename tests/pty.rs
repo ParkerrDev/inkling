@@ -1055,6 +1055,26 @@ mod atuin {
         shell
     }
 
+    /// A first session in the whole stack, for Atuin to have a database to
+    /// be read.
+    fn warm_up_the_whole_stack(sandbox: &Sandbox) {
+        let mut shell = start_whole_stack(sandbox, &[("INKLING", "0")]);
+        for command in ["true", "echo first", "echo second"] {
+            shell.send(format!("{command}\r").as_bytes());
+            shell.settle(Duration::from_millis(600));
+        }
+        shell.send(b"exit\r");
+        shell.exit_status(Duration::from_secs(10)).expect("exits");
+        std::thread::sleep(Duration::from_millis(500));
+    }
+
+    fn at_the_stacks_prompt(shell: &mut Terminal) {
+        shell.wait_for(Duration::from_secs(5), |s| {
+            s.row(s.cursor().1).contains('\u{276f}')
+        });
+        shell.settle(Duration::from_millis(300));
+    }
+
     #[test]
     fn this_machines_whole_shell_stack_looks_the_same_and_gains_suggestions() {
         if !whole_stack_available() {
@@ -1063,16 +1083,7 @@ mod atuin {
         }
         let sandbox = Sandbox::new();
         sandbox.atuin_config();
-        // A first session, for Atuin to have a database to be read.
-        let mut shell = start_whole_stack(&sandbox, &[("INKLING", "0")]);
-        for command in ["true", "echo first", "echo second"] {
-            shell.send(format!("{command}\r").as_bytes());
-            shell.settle(Duration::from_millis(600));
-        }
-        shell.send(b"exit\r");
-        shell.exit_status(Duration::from_secs(10)).expect("exits");
-        drop(shell);
-        std::thread::sleep(Duration::from_millis(500));
+        warm_up_the_whole_stack(&sandbox);
 
         // The first screen, without inkling and with it.
         let plain = start_whole_stack(&sandbox, &[("INKLING", "0")]);
@@ -1100,10 +1111,7 @@ mod atuin {
         );
         shell.send(b"\r");
         assert!(shell.wait_text("first\n"), "{}", shell.screen.text());
-        shell.wait_for(Duration::from_secs(5), |s| {
-            s.row(s.cursor().1).contains('\u{276f}')
-        });
-        shell.settle(Duration::from_millis(300));
+        at_the_stacks_prompt(&mut shell);
         // Tab completion, as it is without inkling.
         shell.type_and_settle(b"ls /usr/shar");
         shell.type_and_settle(b"\t");
