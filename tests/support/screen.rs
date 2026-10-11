@@ -82,6 +82,14 @@ struct Modes {
     bracketed_paste: bool,
 }
 
+/// A numeric parameter, with 1 for one left out or given as 0.
+fn param(params: &[usize], index: usize) -> usize {
+    match params.get(index).copied() {
+        None | Some(0) => 1,
+        Some(value) => value,
+    }
+}
+
 fn blank_grid(rows: usize, cols: usize) -> Grid {
     vec![vec![Cell::BLANK; cols]; rows]
 }
@@ -443,55 +451,63 @@ impl Screen {
     }
 
     fn csi(&mut self, last: u8, private: bool, params: &[usize]) {
-        let n = |index: usize, default: usize| match params.get(index).copied() {
-            None | Some(0) => default,
-            Some(value) => value,
-        };
         if private {
             self.private_mode(last, params);
             return;
         }
+        if !self.motion(last, params) {
+            self.edit(last, params);
+        }
+        if !matches!(
+            last,
+            b'm' | b's' | b'n' | b'c' | b'K' | b'J' | b'X' | b'P' | b'@'
+        ) {
+            self.pending = false;
+        }
+    }
+
+    /// The sequences that move the cursor. Returns whether `last` was one.
+    fn motion(&mut self, last: u8, params: &[usize]) -> bool {
+        let n = |index: usize| param(params, index);
+        let last_row = self.rows.saturating_sub(1);
+        let last_col = self.cols.saturating_sub(1);
         match last {
-            b'A' => self.y = self.y.saturating_sub(n(0, 1)),
-            b'B' | b'e' => {
-                self.y = self
-                    .y
-                    .saturating_add(n(0, 1))
-                    .min(self.rows.saturating_sub(1))
-            }
-            b'C' | b'a' => {
-                self.x = self
-                    .x
-                    .saturating_add(n(0, 1))
-                    .min(self.cols.saturating_sub(1))
-            }
-            b'D' => self.x = self.x.saturating_sub(n(0, 1)),
+            b'A' => self.y = self.y.saturating_sub(n(0)),
+            b'B' | b'e' => self.y = self.y.saturating_add(n(0)).min(last_row),
+            b'C' | b'a' => self.x = self.x.saturating_add(n(0)).min(last_col),
+            b'D' => self.x = self.x.saturating_sub(n(0)),
             b'E' => {
-                self.y = self
-                    .y
-                    .saturating_add(n(0, 1))
-                    .min(self.rows.saturating_sub(1));
+                self.y = self.y.saturating_add(n(0)).min(last_row);
                 self.x = 0;
             }
             b'F' => {
-                self.y = self.y.saturating_sub(n(0, 1));
+                self.y = self.y.saturating_sub(n(0));
                 self.x = 0;
             }
-            b'G' | b'`' => self.x = n(0, 1).saturating_sub(1).min(self.cols.saturating_sub(1)),
-            b'd' => self.y = n(0, 1).saturating_sub(1).min(self.rows.saturating_sub(1)),
+            b'G' | b'`' => self.x = n(0).saturating_sub(1).min(last_col),
+            b'd' => self.y = n(0).saturating_sub(1).min(last_row),
             b'H' | b'f' => {
-                self.y = n(0, 1).saturating_sub(1).min(self.rows.saturating_sub(1));
-                self.x = n(1, 1).saturating_sub(1).min(self.cols.saturating_sub(1));
+                self.y = n(0).saturating_sub(1).min(last_row);
+                self.x = n(1).saturating_sub(1).min(last_col);
             }
+            _ => return false,
+        }
+        true
+    }
+
+    /// Erasing, inserting, deleting, attributes, saving and the queries.
+    fn edit(&mut self, last: u8, params: &[usize]) {
+        let n = |index: usize| param(params, index);
+        match last {
             b'J' => self.erase_display(params.first().copied().unwrap_or(0)),
             b'K' => self.erase_line(params.first().copied().unwrap_or(0)),
-            b'L' => self.insert_lines(n(0, 1)),
-            b'M' => self.delete_lines(n(0, 1)),
-            b'P' => self.delete_chars(n(0, 1)),
-            b'@' => self.insert_chars(n(0, 1)),
-            b'X' => self.erase_chars(n(0, 1)),
-            b'S' => self.scroll_up(n(0, 1)),
-            b'T' => self.scroll_down(n(0, 1)),
+            b'L' => self.insert_lines(n(0)),
+            b'M' => self.delete_lines(n(0)),
+            b'P' => self.delete_chars(n(0)),
+            b'@' => self.insert_chars(n(0)),
+            b'X' => self.erase_chars(n(0)),
+            b'S' => self.scroll_up(n(0)),
+            b'T' => self.scroll_down(n(0)),
             b'm' => self.sgr(params),
             b's' => self.saved = Some(self.save()),
             b'u' => {
@@ -510,12 +526,6 @@ impl Screen {
             b'n' if params.first() == Some(&5) => self.replies.extend_from_slice(b"\x1b[0n"),
             b'c' => self.replies.extend_from_slice(b"\x1b[?62;c"),
             _ => {}
-        }
-        if !matches!(
-            last,
-            b'm' | b's' | b'n' | b'c' | b'K' | b'J' | b'X' | b'P' | b'@'
-        ) {
-            self.pending = false;
         }
     }
 
