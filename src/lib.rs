@@ -10,6 +10,7 @@
 //! only to the terminal and the pseudo-terminal it was given. The program in
 //! `main.rs` is a thin face over it.
 
+pub mod brain;
 pub mod column;
 pub mod engine;
 pub mod error;
@@ -18,8 +19,11 @@ pub mod index;
 pub mod init;
 pub mod keys;
 pub mod osc;
+pub mod proxy;
+pub mod pty;
 pub mod quote;
 pub mod render;
+pub mod session;
 pub mod text;
 
 pub use error::{Error, Result};
