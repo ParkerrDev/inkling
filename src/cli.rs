@@ -62,13 +62,22 @@ fn doctor() -> Result<i32> {
     Ok(i32::from(!report.all_well()))
 }
 
-/// Pull `--arg0 NAME` off the front, then an optional `--`.
-fn split_name(mut rest: &[&OsStr]) -> (Option<OsString>, Vec<OsString>) {
-    let mut name = None;
-    if let [flag, given, tail @ ..] = rest
+/// What comes before the command in `run` and in the hidden session command.
+struct Options {
+    arg0: Option<OsString>,
+    command: Vec<OsString>,
+}
+
+/// Read `--arg0 NAME`, then an optional `--`; the rest is the command.
+fn options(mut rest: &[&OsStr]) -> Options {
+    let mut found = Options {
+        arg0: None,
+        command: Vec::new(),
+    };
+    if let [flag, value, tail @ ..] = rest
         && *flag == "--arg0"
     {
-        name = Some((*given).to_owned());
+        found.arg0 = Some((*value).to_owned());
         rest = tail;
     }
     if let [dashes, tail @ ..] = rest
@@ -76,17 +85,18 @@ fn split_name(mut rest: &[&OsStr]) -> (Option<OsString>, Vec<OsString>) {
     {
         rest = tail;
     }
-    (name, rest.iter().map(|word| (*word).to_owned()).collect())
+    found.command = rest.iter().map(|word| (*word).to_owned()).collect();
+    found
 }
 
 fn run_command(rest: &[&OsStr]) -> Result<i32> {
-    let (name, mut command) = split_name(rest);
+    let Options { arg0, mut command } = options(rest);
     if command.is_empty() {
         command.push(std::env::var_os("SHELL").unwrap_or_else(|| "bash".into()));
     }
     if std::env::var_os("INKLING").is_some_and(|value| value == "0") {
         // Turned off: the program runs as if inkling were not there.
-        return replace_with(name.as_deref(), &command);
+        return replace_with(arg0.as_deref(), &command);
     }
     let style = std::env::var("INKLING_STYLE")
         .ok()
@@ -94,7 +104,8 @@ fn run_command(rest: &[&OsStr]) -> Result<i32> {
         .unwrap_or_else(Style::dim);
     let settings = Settings {
         command,
-        arg0: name,
+        arg0,
+        environ: std::env::var("INKLING_ENVIRON").ok(),
         style,
         env: history::Env::from_process(),
     };
@@ -103,11 +114,11 @@ fn run_command(rest: &[&OsStr]) -> Result<i32> {
 
 /// The hidden command: become the session leader and then the program.
 fn start_session(rest: &[&OsStr]) -> Result<i32> {
-    let (name, command) = split_name(rest);
+    let Options { arg0, command, .. } = options(rest);
     let Some((program, tail)) = command.split_first() else {
         bail!("no command to run");
     };
-    Err(session::enter(program, tail, name.as_deref()).into())
+    Err(session::enter(program, tail, arg0.as_deref()).into())
 }
 
 /// Become the program, with nothing in between.

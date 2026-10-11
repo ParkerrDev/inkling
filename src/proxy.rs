@@ -8,9 +8,10 @@
 //! The loop knows nothing of suggestions: the [`Engine`] decides what to do
 //! with each chunk, and this carries it out.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::{self, Read};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
@@ -33,6 +34,7 @@ use crate::engine::{Engine, Event, Mode, Out, Tty};
 use crate::error::{Error, Result};
 use crate::history;
 use crate::pty::{self, Pty};
+use crate::quote;
 use crate::render::Style;
 use crate::session;
 
@@ -53,6 +55,9 @@ pub struct Settings {
     pub command: Vec<OsString>,
     /// What the program is told its name is, if not the program's own.
     pub arg0: Option<OsString>,
+    /// The environment to start the program with, in place of this
+    /// process's own, one entry to a line in the shell's own quoting.
+    pub environ: Option<String>,
     pub style: Style,
     pub env: history::Env,
 }
@@ -135,9 +140,16 @@ fn spawn(settings: &Settings, pty: &Pty, nonce: &str) -> Result<Child> {
     if let Some(name) = &settings.arg0 {
         command.arg("--arg0").arg(name);
     }
+    command.arg("--").args(&settings.command);
+    if let Some(lines) = settings
+        .environ
+        .as_deref()
+        .filter(|lines| !lines.is_empty())
+    {
+        command.env_clear();
+        command.envs(environment(lines));
+    }
     command
-        .arg("--")
-        .args(&settings.command)
         .env(session::NONCE_VARIABLE, nonce)
         .env_remove(session::SHELL_VARIABLE)
         .stdin(copy("share the pseudo-terminal")?)
@@ -151,6 +163,26 @@ fn spawn(settings: &Settings, pty: &Pty, nonce: &str) -> Result<Child> {
             .unwrap_or_default(),
         source,
     })
+}
+
+/// The variables in `lines`: `NAME=value` entries, one to a line, each
+/// quoted the way the shell's `printf %q` quotes. A line that is not an entry
+/// is left out.
+fn environment(lines: &str) -> Vec<(OsString, OsString)> {
+    lines
+        .lines()
+        .filter_map(|line| {
+            let entry = quote::unquote(line.as_bytes()).ok()?;
+            let at = entry.iter().position(|b| *b == b'=')?;
+            let (name, value) = entry.split_at(at);
+            (!name.is_empty()).then(|| {
+                (
+                    OsStr::from_bytes(name).to_owned(),
+                    OsStr::from_bytes(value.get(1..).unwrap_or_default()).to_owned(),
+                )
+            })
+        })
+        .collect()
 }
 
 /// The person's terminal in raw mode for as long as this lives.
@@ -589,4 +621,34 @@ fn write_all(fd: BorrowedFd<'_>, mut bytes: &[u8]) -> Result<()> {
         "write to the terminal",
         io::Error::from(io::ErrorKind::WriteZero),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_environment_is_read_from_quoted_lines() {
+        let vars =
+            environment("A=1\nB=two\\ words\n$'C=with\\nnewline'\nEMPTY=\n=bad\nnoequals\nD=x=y\n");
+        let text: Vec<(String, String)> = vars
+            .into_iter()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.to_string_lossy().into_owned(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            text,
+            [
+                ("A".to_owned(), "1".to_owned()),
+                ("B".to_owned(), "two words".to_owned()),
+                ("C".to_owned(), "with\nnewline".to_owned()),
+                ("EMPTY".to_owned(), String::new()),
+                ("D".to_owned(), "x=y".to_owned()),
+            ]
+        );
+    }
 }

@@ -206,7 +206,10 @@ impl Terminal {
         let written = rustix::io::write(&self.master, bytes).unwrap();
         assert_eq!(written, bytes.len());
         let mut fds = [PollFd::new(&self.master, PollFlags::IN)];
-        let timeout = Timespec { tv_sec: 2, tv_nsec: 0 };
+        let timeout = Timespec {
+            tv_sec: 2,
+            tv_nsec: 0,
+        };
         poll(&mut fds, Some(&timeout)).unwrap();
         let first = started.elapsed();
         self.pump(Duration::ZERO);

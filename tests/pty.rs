@@ -485,7 +485,10 @@ mod tests {
         assert!(dim.ends_with('\u{2026}'), "{dim:?}");
         // Nothing wrapped: the suggestion stayed on its row, and the cursor
         // stayed at the end of what was typed.
-        assert_eq!(shell.screen.cursor(), ("$ echo 0123456789012345678901234567890123456789".len(), 0));
+        assert_eq!(
+            shell.screen.cursor(),
+            ("$ echo 0123456789012345678901234567890123456789".len(), 0)
+        );
         assert_eq!(shell.screen.row(1), "");
         shell.type_and_settle(b"\x1b[C");
         assert_eq!(
@@ -505,6 +508,54 @@ mod tests {
         assert!(!shell.screen.any_dim(), "{}", shell.screen.text());
         shell.type_and_settle(b" ");
         assert_eq!(shell.dim_on_cursor_row(), "status");
+    }
+
+    /// What kitty and ghostty do: start bash in POSIX mode with a script of
+    /// their own to run, which takes itself and its marker out of the
+    /// environment, turns POSIX mode off, and runs the person's startup.
+    #[test]
+    fn a_terminals_own_shell_integration_is_replayed_for_the_shell_in_the_proxy() {
+        let sandbox = Sandbox::new();
+        sandbox.write_history(HISTORY);
+        let rc = sandbox.rc_around("", "");
+        let integration = sandbox.home().join("terminal-integration.bash");
+        std::fs::write(
+            &integration,
+            format!(
+                "[[ -n $TERMINAL_INJECT ]] || return\nprintf 'ran %s\\n' \"$$\" >> \"$HOME/injection.log\"\n\
+                 unset TERMINAL_INJECT ENV\nset +o posix\nexport PATH_ADDED_BY_RC=${{PATH_ADDED_BY_RC-}}x\n. {}\n",
+                rc.display()
+            ),
+        )
+        .unwrap();
+        let mut env = sandbox.env();
+        env.push(("ENV".into(), integration.display().to_string()));
+        env.push(("TERMINAL_INJECT".into(), "1".into()));
+        let argv = ["bash".to_owned(), "--posix".to_owned()];
+        let mut shell = Terminal::start(&Launch {
+            argv: &argv,
+            env,
+            dir: &sandbox.home(),
+            size: (24, 80),
+        });
+        assert!(shell.wait_for(Duration::from_secs(10), |s| s.row(s.cursor().1) == "$"));
+        shell.settle(Duration::from_millis(100));
+        shell.type_and_settle(b"git");
+        assert_eq!(shell.dim_on_cursor_row(), " status");
+        shell.send(b"\x15");
+        shell.settle(Duration::from_millis(50));
+        // The shell in the proxy is the one the terminal's script made: out
+        // of POSIX mode, and with the environment set once, not twice.
+        shell.command("[[ -o posix ]] && echo posix-on || echo posix-off");
+        assert!(shell.wait_text("posix-off"), "{}", shell.screen.text());
+        shell.command("echo added=$PATH_ADDED_BY_RC");
+        assert!(shell.wait_text("added=x\n"), "{}", shell.screen.text());
+        let log = std::fs::read_to_string(sandbox.home().join("injection.log")).unwrap();
+        assert_eq!(
+            log.lines().count(),
+            2,
+            "the script ran once for each shell: {log}"
+        );
     }
 
     #[test]
@@ -814,7 +865,12 @@ mod measure {
 
     fn percentile(times: &mut [Duration], per_cent: usize) -> Duration {
         times.sort_unstable();
-        let at = (times.len() * per_cent / 100).min(times.len().saturating_sub(1));
+        let at = times
+            .len()
+            .saturating_mul(per_cent)
+            .checked_div(100)
+            .unwrap_or(0)
+            .min(times.len().saturating_sub(1));
         times.get(at).copied().unwrap_or_default()
     }
 
@@ -842,7 +898,7 @@ mod measure {
     fn key_times(shell: &mut Terminal, keys: usize) -> Vec<Duration> {
         let mut times = Vec::new();
         for n in 0..keys {
-            let at = n % PATTERN.len();
+            let at = n.checked_rem(PATTERN.len()).unwrap_or(0);
             if at == 0 {
                 shell.send(b"\x15");
                 shell.settle(Duration::from_millis(30));
@@ -876,7 +932,10 @@ mod measure {
         let with = Sandbox::new();
         with.write_history(&history());
         let mut shell = with.shell("");
-        let wrapped = summary("echo and suggestion, with inkling", key_times(&mut shell, 300));
+        let wrapped = summary(
+            "echo and suggestion, with inkling",
+            key_times(&mut shell, 300),
+        );
         eprintln!(
             "added by inkling, medians: {}",
             micros(wrapped.saturating_sub(plain))
@@ -907,9 +966,18 @@ mod measure {
         let mut wrapped_times = time(true);
         let wrapped = median(&mut wrapped_times);
         let millis = |t: Duration| format!("{:6.1} ms", t.as_secs_f64() * 1e3);
-        eprintln!("shell start to first prompt, bash alone:    median {}", millis(plain));
-        eprintln!("shell start to first prompt, with inkling:  median {}", millis(wrapped));
-        eprintln!("added by inkling:                           {}", millis(wrapped.saturating_sub(plain)));
+        eprintln!(
+            "shell start to first prompt, bash alone:    median {}",
+            millis(plain)
+        );
+        eprintln!(
+            "shell start to first prompt, with inkling:  median {}",
+            millis(wrapped)
+        );
+        eprintln!(
+            "added by inkling:                           {}",
+            millis(wrapped.saturating_sub(plain))
+        );
         let mut inits = Vec::new();
         for _ in 0..50 {
             let started = Instant::now();
@@ -920,7 +988,10 @@ mod measure {
             assert!(output.status.success());
             inits.push(started.elapsed());
         }
-        eprintln!("`inkling init bash`, run and read:         median {}", millis(median(&mut inits)));
+        eprintln!(
+            "`inkling init bash`, run and read:         median {}",
+            millis(median(&mut inits))
+        );
     }
 
     fn rss(pid: u32) -> (u64, u64) {
@@ -953,8 +1024,8 @@ mod measure {
             let (now, peak) = rss(shell.pid());
             eprintln!(
                 "{rows:7} runs in history: proxy resident {:6.1} MiB (peak {:6.1} MiB); prompt after {:5.0} ms",
-                now as f64 / 1024.0,
-                peak as f64 / 1024.0,
+                f64::from(u32::try_from(now).unwrap()) / 1024.0,
+                f64::from(u32::try_from(peak).unwrap()) / 1024.0,
                 up.as_secs_f64() * 1e3
             );
         }

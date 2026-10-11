@@ -144,10 +144,17 @@ impl Sandbox {
     pub fn big_atuin_db(&self, rows: usize) -> PathBuf {
         let mut seed: u64 = 0x2545_f491_4f6c_dd1d;
         let mut next = move |bound: u64| {
-            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
-            seed.checked_shr(33).unwrap_or(0).checked_rem(bound).unwrap_or(0)
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            seed.checked_shr(33)
+                .unwrap_or(0)
+                .checked_rem(bound)
+                .unwrap_or(0)
         };
-        let tools = ["git", "cargo", "ls", "cd", "docker", "kubectl", "make", "npm", "ssh", "grep"];
+        let tools = [
+            "git", "cargo", "ls", "cd", "docker", "kubectl", "make", "npm", "ssh", "grep",
+        ];
         let commands: Vec<(String, String)> = (0..rows)
             .map(|_| {
                 let tool = tools[usize::try_from(next(10)).unwrap()];
@@ -160,7 +167,10 @@ impl Sandbox {
                 (command, format!("/home/dir{}", next(60)))
             })
             .collect();
-        let pairs: Vec<(&str, &str)> = commands.iter().map(|(c, d)| (c.as_str(), d.as_str())).collect();
+        let pairs: Vec<(&str, &str)> = commands
+            .iter()
+            .map(|(c, d)| (c.as_str(), d.as_str()))
+            .collect();
         self.atuin_db(&pairs)
     }
 
