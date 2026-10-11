@@ -87,8 +87,7 @@ pub fn run(settings: &Settings) -> Result<i32> {
     let columns = usize::from(size.ws_col);
     let engine = Engine::new(&nonce, columns, settings.style.clone(), brain);
     let _raw = RawMode::enter(&settings_of_terminal)?;
-    let mut proxy = Proxy::new(master, child, engine, signals);
-    proxy.run()
+    Proxy::new(master, child, engine, signals).run()
 }
 
 /// The real terminal's settings and size.
@@ -328,12 +327,22 @@ impl Proxy {
     }
 
     /// Carry bytes until the shell is gone. Returns its exit status.
-    fn run(&mut self) -> Result<i32> {
-        let over = self.serve()?;
-        self.drain_output()?;
-        self.engine.finish(&mut self.out);
-        self.apply()?;
-        Ok(self.reap(&over))
+    fn run(mut self) -> Result<i32> {
+        let over = self.serve();
+        if matches!(over, Ok(Over::ShellGone)) {
+            // The shell has said its last; there may be some of it to show.
+            self.drain_output()?;
+            self.engine.finish(&mut self.out);
+            self.apply()?;
+        }
+        let Self {
+            master, mut child, ..
+        } = self;
+        // Whoever is left on the terminal is hung up on, as when a terminal
+        // window closes.
+        drop(master);
+        let status = reap(&mut child);
+        over.map(|_| status)
     }
 
     fn serve(&mut self) -> Result<Over> {
@@ -567,36 +576,31 @@ impl Proxy {
             Err(source) => Err(Error::io("read from the shell", source)),
         }
     }
+}
 
-    /// Wait for the shell to be gone, hanging up on it if the terminal is.
-    fn reap(&mut self, over: &Over) -> i32 {
-        if matches!(over, Over::Hangup) {
-            // Closing the master (when this ends) hangs the terminal up on
-            // the shell; give it a moment to take the hint.
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        let mut status = None;
-        for _ in 0..REAP_TURNS {
-            match self.child.try_wait() {
-                Ok(Some(done)) => {
-                    status = Some(done);
-                    break;
-                }
-                Ok(None) => std::thread::sleep(REAP_STEP),
-                Err(_) => break,
+/// Wait for the shell to be gone, and its exit status as a shell reports it.
+fn reap(child: &mut Child) -> i32 {
+    let mut status = None;
+    for _ in 0..REAP_TURNS {
+        match child.try_wait() {
+            Ok(Some(done)) => {
+                status = Some(done);
+                break;
             }
+            Ok(None) => std::thread::sleep(REAP_STEP),
+            Err(_) => break,
         }
-        if let Some(status) = status {
-            return status
-                .code()
-                .or_else(|| status.signal().map(|signal| signal.saturating_add(128)))
-                .unwrap_or(1);
-        }
-        // It did not leave. Make it.
-        let _killed = self.child.kill();
-        let _reaped = self.child.wait();
-        1
     }
+    if let Some(status) = status {
+        return status
+            .code()
+            .or_else(|| status.signal().map(|signal| signal.saturating_add(128)))
+            .unwrap_or(1);
+    }
+    // It did not leave. Make it.
+    let _killed = child.kill();
+    let _reaped = child.wait();
+    1
 }
 
 /// Write all of `bytes`, waiting for the descriptor when it is full.

@@ -456,6 +456,179 @@ mod tests {
         assert_eq!(shell.dim_on_cursor_row(), "elsewhere");
     }
 
+    struct Tmux(String);
+
+    impl Tmux {
+        fn run(&self, args: &[&str]) -> String {
+            let output = std::process::Command::new("tmux")
+                .args(["-L", &self.0])
+                .args(args)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        }
+
+        fn pane(&self) -> String {
+            self.run(&["capture-pane", "-p", "-e", "-t", "t"])
+        }
+
+        fn wait_for(&self, what: &str, condition: impl Fn(&str) -> bool) -> String {
+            let started = Instant::now();
+            loop {
+                let pane = self.pane();
+                if condition(&pane) {
+                    return pane;
+                }
+                assert!(
+                    started.elapsed() < Duration::from_secs(8),
+                    "{what}: {pane:?}"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+
+    impl Drop for Tmux {
+        fn drop(&mut self) {
+            self.run(&["kill-server"]);
+        }
+    }
+
+    /// An independent terminal emulator's view of what is drawn.
+    #[test]
+    fn tmux_sees_a_faint_suggestion_with_the_cursor_where_the_typing_is() {
+        if std::process::Command::new("tmux")
+            .arg("-V")
+            .output()
+            .is_err()
+        {
+            eprintln!("no tmux here: skipped");
+            return;
+        }
+        let sandbox = Sandbox::new();
+        sandbox.write_history(HISTORY);
+        let rc = sandbox.rc_around("", "");
+        let tmux = Tmux(format!("inkling-test-{}", std::process::id()));
+        let env: Vec<String> = sandbox
+            .env()
+            .into_iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect();
+        let command = format!(
+            "env -i {} bash --noprofile --rcfile {} -i",
+            env.join(" "),
+            rc.display()
+        );
+        tmux.run(&[
+            "new-session",
+            "-d",
+            "-s",
+            "t",
+            "-x",
+            "80",
+            "-y",
+            "24",
+            &command,
+        ]);
+        tmux.wait_for("a prompt", |pane| pane.starts_with('$'));
+        std::thread::sleep(Duration::from_millis(100));
+        tmux.run(&["send-keys", "-t", "t", "git"]);
+        let pane = tmux.wait_for("the suggestion", |pane| pane.contains("\x1b[2m status"));
+        assert!(pane.starts_with("$ git\x1b[2m status"), "{pane:?}");
+        assert_eq!(
+            tmux.run(&["display", "-p", "-t", "t", "#{cursor_x},#{cursor_y}"])
+                .trim(),
+            "5,0"
+        );
+        tmux.run(&["send-keys", "-t", "t", "Right"]);
+        let pane = tmux.wait_for("it taken", |pane| pane.starts_with("$ git status"));
+        assert!(!pane.contains("\x1b[2m"), "{pane:?}");
+        tmux.run(&["send-keys", "-t", "t", "C-u", "echo"]);
+        tmux.wait_for("another", |pane| pane.contains("$ echo\x1b[2m hello world"));
+        tmux.run(&["send-keys", "-t", "t", "M-f"]);
+        tmux.wait_for("one word", |pane| {
+            pane.contains("$ echo hello\x1b[2m world")
+        });
+    }
+
+    #[test]
+    fn job_control_works_through_the_proxy() {
+        let (_sandbox, mut shell) = shell_with_history();
+        shell.send(b"sleep 30\r");
+        shell.settle(Duration::from_millis(200));
+        shell.send(b"\x1a");
+        shell.wait_prompt();
+        assert!(
+            shell.screen.text().contains("Stopped"),
+            "{}",
+            shell.screen.text()
+        );
+        shell.command("jobs");
+        assert!(shell.wait_text("sleep 30"), "{}", shell.screen.text());
+        shell.send(b"fg\r");
+        shell.settle(Duration::from_millis(200));
+        shell.send(b"\x03");
+        shell.wait_prompt();
+        shell.type_and_settle(b"git");
+        assert_eq!(shell.dim_on_cursor_row(), " status");
+    }
+
+    #[test]
+    fn a_lot_of_output_arrives_whole() {
+        let (_sandbox, mut shell) = shell_with_history();
+        shell.send(b"seq 1 100000\r");
+        shell.wait_prompt();
+        let text = shell.screen.all_text();
+        let numbers: Vec<u32> = text
+            .lines()
+            .filter_map(|line| line.trim().parse().ok())
+            .collect();
+        assert_eq!(numbers.len(), 100_000);
+        assert!(numbers.windows(2).all(|w| w[1] == w[0] + 1), "out of order");
+        assert_eq!(numbers.first(), Some(&1));
+    }
+
+    #[test]
+    fn a_lot_of_input_arrives_whole() {
+        let (_sandbox, mut shell) = shell_with_history();
+        shell.command("stty -echo");
+        shell.send(b"cat > received\r");
+        shell.settle(Duration::from_millis(100));
+        let line = "the quick brown fox jumps over the lazy dog 0123456789\n";
+        let lines = 20_000;
+        for _ in 0..lines {
+            shell.send(line.as_bytes());
+        }
+        shell.send(b"\x04");
+        shell.wait_prompt();
+        shell.command("wc -c < received");
+        assert!(
+            shell.wait_text(&(line.len() * lines).to_string()),
+            "{}",
+            shell.screen.text()
+        );
+    }
+
+    #[test]
+    fn closing_the_terminal_ends_the_shell() {
+        let (_sandbox, mut shell) = shell_with_history();
+        shell.command("echo shell=$$");
+        let text = shell.screen.text();
+        let pid: u32 = text
+            .lines()
+            .find_map(|line| line.strip_prefix("shell="))
+            .and_then(|n| n.trim().parse().ok())
+            .expect("the shell says its id");
+        shell.close_terminal();
+        let started = Instant::now();
+        let alive = |pid: u32| std::path::Path::new(&format!("/proc/{pid}")).exists();
+        while (alive(pid) || !shell.has_exited()) && started.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!alive(pid), "the shell outlived its terminal");
+        assert!(shell.has_exited(), "the proxy outlived its terminal");
+    }
+
     #[test]
     fn ctrl_c_and_ctrl_l_leave_the_next_prompt_working() {
         let (_sandbox, mut shell) = shell_with_history();

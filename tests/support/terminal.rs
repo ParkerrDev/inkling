@@ -261,6 +261,24 @@ impl Terminal {
     }
 }
 
+impl Terminal {
+    /// Close our end, as a terminal window closing does.
+    pub fn close_terminal(&mut self) {
+        // The child is told its terminal is gone by the kernel when the last
+        // holder of this end lets go; this keeps no other.
+        let master = std::mem::replace(
+            &mut self.master,
+            rustix::fs::open("/dev/null", OFlags::RDWR, Mode::empty()).unwrap(),
+        );
+        drop(master);
+    }
+
+    /// Whether the program has exited (and so been collected).
+    pub fn has_exited(&mut self) -> bool {
+        self.child.try_wait().unwrap().is_some()
+    }
+}
+
 impl Drop for Terminal {
     fn drop(&mut self) {
         let _ = self.child.kill();
