@@ -847,7 +847,7 @@ mod atuin {
     use std::time::{Duration, Instant};
 
     use super::support::sandbox::Sandbox;
-    use super::support::terminal::Terminal;
+    use super::support::terminal::{Launch, Terminal};
 
     const PREEXEC: &str = "/usr/share/bash-preexec/bash-preexec.sh";
 
@@ -980,6 +980,109 @@ mod atuin {
             );
             assert!(commands.contains(&"echo st=$?".to_owned()), "{commands:?}");
         }
+    }
+
+    const OMARCHY: &str = "/usr/share/omarchy/default/bash";
+
+    /// The startup of this machine's own ~/.bashrc, after the inkling line:
+    /// Omarchy's shell setup (starship, zoxide, mise, fzf, completion), then
+    /// Atuin on bash-preexec.
+    fn the_whole_stack() -> String {
+        format!(
+            "[[ -r {OMARCHY}/env-bootstrap ]] && source {OMARCHY}/env-bootstrap\n\
+             source \"$OMARCHY_PATH/default/bash/rc\"\n\
+             source {PREEXEC}\neval \"$(atuin init bash)\"\n"
+        )
+    }
+
+    fn whole_stack_available() -> bool {
+        available()
+            && Path::new(OMARCHY).is_dir()
+            && std::env::var_os("PATH").is_some_and(|paths| {
+                std::env::split_paths(&paths).any(|dir| dir.join("starship").is_file())
+            })
+    }
+
+    fn start_whole_stack(sandbox: &Sandbox, env: &[(&str, &str)]) -> Terminal {
+        let rc = sandbox.home().join("stack.sh");
+        let body = format!(
+            "HISTFILE={}\nHISTCONTROL=ignoreboth\neval \"$(inkling init bash)\"\n{}",
+            sandbox.histfile().display(),
+            the_whole_stack()
+        );
+        std::fs::write(&rc, body).unwrap();
+        let argv = Sandbox::bash_argv(&rc);
+        let mut vars = sandbox.env();
+        vars.retain(|(name, _)| name != "TERM");
+        vars.push(("TERM".into(), "xterm-kitty".into()));
+        vars.push(("SHELL".into(), "/usr/bin/bash".into()));
+        vars.extend(env.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())));
+        let mut shell = Terminal::start(&Launch {
+            argv: &argv,
+            env: vars,
+            dir: &sandbox.home(),
+            size: (24, 100),
+        });
+        let prompt = shell.wait_for(Duration::from_secs(20), |screen| {
+            screen.row(screen.cursor().1).contains('\u{276f}')
+        });
+        assert!(prompt, "no prompt:\n{}", shell.screen.all_text());
+        shell.settle(Duration::from_millis(300));
+        shell
+    }
+
+    #[test]
+    fn this_machines_whole_shell_stack_looks_the_same_and_gains_suggestions() {
+        if !whole_stack_available() {
+            eprintln!("no Omarchy shell setup, starship or atuin here: skipped");
+            return;
+        }
+        let sandbox = Sandbox::new();
+        sandbox.atuin_config();
+        // A first session, for Atuin to have a database to be read.
+        let mut shell = start_whole_stack(&sandbox, &[("INKLING", "0")]);
+        for command in ["true", "echo first", "echo second"] {
+            shell.send(format!("{command}\r").as_bytes());
+            shell.settle(Duration::from_millis(600));
+        }
+        shell.send(b"exit\r");
+        shell.exit_status(Duration::from_secs(10)).expect("exits");
+        drop(shell);
+        std::thread::sleep(Duration::from_millis(500));
+
+        // The first screen, without inkling and with it.
+        let plain = start_whole_stack(&sandbox, &[("INKLING", "0")]);
+        let plain_screen = plain.screen.text();
+        drop(plain);
+        let mut shell = start_whole_stack(&sandbox, &[]);
+        assert_eq!(shell.screen.text(), plain_screen, "the first prompt is the same");
+
+        shell.type_and_settle(b"echo f");
+        assert!(shell.cursor_row().ends_with("echo first"), "{}", shell.screen.text());
+        assert_eq!(shell.dim_on_cursor_row(), "irst", "{}", shell.screen.text());
+        shell.type_and_settle(b"\x1b[C");
+        assert!(shell.cursor_row().ends_with("echo first"), "{}", shell.screen.text());
+        shell.send(b"\r");
+        assert!(shell.wait_text("first\n"), "{}", shell.screen.text());
+        shell.wait_for(Duration::from_secs(5), |s| s.row(s.cursor().1).contains('\u{276f}'));
+        shell.settle(Duration::from_millis(300));
+        // Tab completion, as it is without inkling.
+        shell.type_and_settle(b"ls /usr/shar");
+        shell.type_and_settle(b"\t");
+        assert!(shell.cursor_row().contains("/usr/share"), "{}", shell.screen.text());
+        shell.send(b"\x15");
+        shell.settle(Duration::from_millis(200));
+        // Atuin's search, and back.
+        shell.send(b"\x1b[A");
+        shell.settle(Duration::from_millis(900));
+        shell.send(b"\x1b");
+        shell.settle(Duration::from_millis(900));
+        shell.send(b"\x15");
+        shell.settle(Duration::from_millis(200));
+        shell.type_and_settle(b"echo s");
+        assert_eq!(shell.dim_on_cursor_row(), "econd", "{}", shell.screen.text());
+        shell.send(b"\x15exit\r");
+        shell.exit_status(Duration::from_secs(10)).expect("exits");
     }
 
     #[test]
