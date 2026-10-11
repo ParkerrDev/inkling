@@ -226,7 +226,7 @@ impl Terminal {
     /// tail of it is `marker`. Returns how many bytes that was.
     pub fn read_until_tail(&mut self, marker: &[u8], limit: Duration) -> usize {
         let started = Instant::now();
-        let mut total = 0;
+        let mut total: usize = 0;
         let mut tail: Vec<u8> = Vec::new();
         let mut buffer = vec![0_u8; 256 * 1024];
         while started.elapsed() < limit {
@@ -240,9 +240,9 @@ impl Terminal {
                 match rustix::io::read(&self.master, buffer.as_mut_slice()) {
                     Ok(0) | Err(Errno::IO | Errno::AGAIN) => break,
                     Ok(count) => {
-                        total += count;
+                        total = total.saturating_add(count);
                         tail.extend_from_slice(buffer.get(..count).unwrap());
-                        let keep = tail.len().saturating_sub(marker.len() * 2);
+                        let keep = tail.len().saturating_sub(marker.len().saturating_mul(2));
                         tail.drain(..keep);
                     }
                     Err(Errno::INTR) => {}
