@@ -222,6 +222,40 @@ impl Terminal {
         self.child.id()
     }
 
+    /// Read everything the program writes, without drawing it, until the
+    /// tail of it is `marker`. Returns how many bytes that was.
+    pub fn read_until_tail(&mut self, marker: &[u8], limit: Duration) -> usize {
+        let started = Instant::now();
+        let mut total = 0;
+        let mut tail: Vec<u8> = Vec::new();
+        let mut buffer = vec![0_u8; 256 * 1024];
+        while started.elapsed() < limit {
+            let mut fds = [PollFd::new(&self.master, PollFlags::IN)];
+            let timeout = Timespec {
+                tv_sec: 0,
+                tv_nsec: 50_000_000,
+            };
+            let _ = poll(&mut fds, Some(&timeout));
+            loop {
+                match rustix::io::read(&self.master, buffer.as_mut_slice()) {
+                    Ok(0) | Err(Errno::IO | Errno::AGAIN) => break,
+                    Ok(count) => {
+                        total += count;
+                        tail.extend_from_slice(buffer.get(..count).unwrap());
+                        let keep = tail.len().saturating_sub(marker.len() * 2);
+                        tail.drain(..keep);
+                    }
+                    Err(Errno::INTR) => {}
+                    Err(error) => panic!("reading failed: {error}"),
+                }
+            }
+            if tail.ends_with(marker) {
+                return total;
+            }
+        }
+        panic!("the output never ended with {marker:?}");
+    }
+
     /// Wait for the first prompt, without waiting any longer than that.
     pub fn wait_prompt_start(&mut self) -> Instant {
         let came = self.wait_for(Duration::from_secs(10), |screen| {

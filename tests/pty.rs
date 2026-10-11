@@ -1167,6 +1167,35 @@ mod measure {
         );
     }
 
+    #[test]
+    #[ignore = "a measurement: scripts/measure"]
+    fn output_throughput() {
+        let measure = |wrapped: bool| {
+            let sandbox = Sandbox::new();
+            sandbox.write_history(&history());
+            let mut shell = if wrapped {
+                sandbox.shell("")
+            } else {
+                let mut shell = sandbox.start(&sandbox.bare_rc(), &[]);
+                let _ = shell.wait_prompt_start();
+                shell
+            };
+            let started = Instant::now();
+            shell.send(b"seq 1 2000000\r");
+            let bytes = shell.read_until_tail(b"2000000\r\n\x1b[?2004h$ ", Duration::from_secs(60));
+            (bytes, started.elapsed())
+        };
+        for (label, wrapped) in [("bash alone", false), ("with inkling", true)] {
+            let (bytes, took) = measure(wrapped);
+            eprintln!(
+                "{label:14} {} MiB of output in {:5.0} ms, {:6.0} MiB/s",
+                bytes / (1024 * 1024),
+                took.as_secs_f64() * 1e3,
+                f64::from(u32::try_from(bytes).unwrap()) / 1048576.0 / took.as_secs_f64()
+            );
+        }
+    }
+
     fn rss(pid: u32) -> (u64, u64) {
         let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
         let kib = |name: &str| {

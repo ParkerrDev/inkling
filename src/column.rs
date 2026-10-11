@@ -105,6 +105,15 @@ impl Column {
         }
     }
 
+    /// Where the cursor is is not known any more, as at the start of a prompt
+    /// after output that was not followed.
+    pub fn forget(&mut self) {
+        self.known = false;
+        self.pending = false;
+        self.parse = Parse::Ground;
+        self.utf8_need = 0;
+    }
+
     /// The terminal changed size; the text on it has been laid out again, so
     /// the cursor is not where it was.
     pub fn resize(&mut self, columns: usize) {

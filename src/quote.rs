@@ -211,4 +211,127 @@ mod tests {
     fn an_unknown_escape_is_an_error() {
         assert_eq!(unquote(b"$'\\q'"), Err(QuoteError::UnknownEscape(b'q')));
     }
+
+    /// Strings of every kind: all the bytes there are, valid text in several
+    /// scripts, and the characters the shell has special feelings about.
+    fn samples() -> Vec<Vec<u8>> {
+        let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = move |bound: usize| {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            usize::try_from(seed.checked_shr(33).unwrap_or(0)).unwrap() % bound
+        };
+        let words = [
+            "git",
+            "commit",
+            "-m",
+            "\"it's\"",
+            "$HOME",
+            "a b",
+            "\u{e9}",
+            "\u{65e5}\u{672c}",
+            "\u{1f600}",
+            "\t",
+            "\n",
+            "\\",
+            "~",
+            "#",
+            "!",
+            "{a,b}",
+            "*",
+            "?",
+        ];
+        let mut out: Vec<Vec<u8>> = (1..=255_u8).map(|b| vec![b]).collect();
+        out.push(Vec::new());
+        for _ in 0..1500 {
+            let mut sample = Vec::new();
+            for _ in 0..=next(10) {
+                if next(3) == 0 {
+                    sample.push(u8::try_from(1 + next(255)).unwrap());
+                } else {
+                    sample.extend_from_slice(words[next(words.len())].as_bytes());
+                    sample.push(b' ');
+                }
+            }
+            out.push(sample);
+        }
+        out
+    }
+
+    #[test]
+    fn what_bash_quotes_is_read_back_as_it_was() {
+        for locale in ["C", "C.UTF-8", "en_US.UTF-8"] {
+            let samples = samples();
+            let mut input = Vec::new();
+            for sample in &samples {
+                input.extend_from_slice(sample);
+                input.push(0);
+            }
+            let mut child = std::process::Command::new("bash")
+                .args([
+                    "-c",
+                    "while IFS= read -r -d '' s; do printf '%q\\0' \"$s\"; done",
+                ])
+                .env("LC_ALL", locale)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut stdin = child.stdin.take().unwrap();
+            let writer = std::thread::spawn(move || {
+                use std::io::Write;
+                stdin.write_all(&input).unwrap();
+            });
+            let output = child.wait_with_output().unwrap();
+            writer.join().unwrap();
+            let quoted: Vec<&[u8]> = output.stdout.split(|b| *b == 0).collect();
+            for (sample, quoted) in samples.iter().zip(quoted) {
+                assert_eq!(
+                    unquote(quoted).as_ref(),
+                    Ok(sample),
+                    "{locale}: {sample:?} was quoted as {}",
+                    String::from_utf8_lossy(quoted)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn quoted_text_has_no_byte_that_would_end_or_split_a_report() {
+        // The marks end at BEL or ESC; a newline would be changed on the
+        // way out of the pseudo-terminal. Quoting must never write them raw.
+        let samples = samples();
+        let mut input = Vec::new();
+        for sample in &samples {
+            input.extend_from_slice(sample);
+            input.push(0);
+        }
+        let mut child = std::process::Command::new("bash")
+            .args([
+                "-c",
+                "while IFS= read -r -d '' s; do printf '%q\\0' \"$s\"; done",
+            ])
+            .env("LC_ALL", "C.UTF-8")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let writer = std::thread::spawn(move || {
+            use std::io::Write;
+            stdin.write_all(&input).unwrap();
+        });
+        let output = child.wait_with_output().unwrap();
+        writer.join().unwrap();
+        for quoted in output.stdout.split(|b| *b == 0) {
+            assert!(
+                !quoted
+                    .iter()
+                    .any(|b| matches!(b, 0x07 | 0x1b | b'\n' | b'\r')),
+                "{:?}",
+                String::from_utf8_lossy(quoted)
+            );
+        }
+    }
 }

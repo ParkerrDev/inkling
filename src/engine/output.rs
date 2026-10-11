@@ -92,7 +92,12 @@ impl<S: Suggest> Engine<S> {
         if bytes.is_empty() {
             return;
         }
-        self.column.feed(bytes);
+        // The cursor matters only at a prompt, and the redraw that follows a
+        // probe puts it at the start of the row before anything else, so
+        // what a running command writes need not be followed.
+        if matches!(self.phase, Phase::Prompt(_)) {
+            self.column.feed(bytes);
+        }
         if self.probing() {
             self.held.extend_from_slice(bytes);
         } else {
@@ -104,6 +109,7 @@ impl<S: Suggest> Engine<S> {
         match mark {
             Mark::Prompt { flags } => {
                 self.release_held(out);
+                self.column.forget();
                 self.phase = Phase::Prompt(Box::new(Prompt::new(&flags)));
                 self.submitted = None;
                 out.events.push(Event::PromptStarted);
