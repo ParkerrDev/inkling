@@ -469,6 +469,71 @@ mod tests {
         );
     }
 
+    fn doctor(sandbox: &Sandbox) -> (bool, String) {
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_inkling"));
+        command
+            .arg("doctor")
+            .env_clear()
+            .current_dir(sandbox.home());
+        for (name, value) in sandbox.env() {
+            command.env(name, value);
+        }
+        let output = command.output().unwrap();
+        (
+            output.status.success(),
+            String::from_utf8(output.stdout).unwrap(),
+        )
+    }
+
+    #[test]
+    fn the_doctor_says_what_it_found() {
+        let sandbox = Sandbox::new();
+        sandbox.write_history(HISTORY);
+        std::fs::write(
+            sandbox.home().join(".bashrc"),
+            "# >>> inkling >>>\neval \"$(inkling init bash)\"\n# <<< inkling <<<\n",
+        )
+        .unwrap();
+        let (well, report) = doctor(&sandbox);
+        assert!(well, "{report}");
+        assert!(report.contains("history file at"), "{report}");
+        assert!(
+            report.contains("3 distinct commands from 3 runs"),
+            "{report}"
+        );
+        assert!(
+            report.contains("~/.bashrc:               starts inkling"),
+            "{report}"
+        );
+        assert!(
+            report.contains("shell integration:       works with bash 5."),
+            "{report}"
+        );
+        assert!(report.contains("everything needed is in place"), "{report}");
+
+        let sandbox = Sandbox::new();
+        sandbox.atuin_db(&[("ls", "/")]);
+        std::fs::write(sandbox.home().join(".bashrc"), "alias l=ls\n").unwrap();
+        let (_, report) = doctor(&sandbox);
+        assert!(report.contains("atuin at"), "{report}");
+        assert!(
+            report.contains("1 distinct commands from 1 runs"),
+            "{report}"
+        );
+        assert!(report.contains("does not start inkling"), "{report}");
+    }
+
+    #[test]
+    fn the_doctor_fails_when_there_is_no_history() {
+        let sandbox = Sandbox::new();
+        let (well, report) = doctor(&sandbox);
+        assert!(!well, "{report}");
+        assert!(
+            report.contains("there is no history to suggest from"),
+            "{report}"
+        );
+    }
+
     #[test]
     fn it_does_not_start_where_there_is_no_terminal() {
         let sandbox = Sandbox::new();

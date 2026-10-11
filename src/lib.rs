@@ -12,6 +12,7 @@
 
 pub mod brain;
 pub mod column;
+pub mod doctor;
 pub mod engine;
 pub mod error;
 pub mod history;

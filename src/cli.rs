@@ -5,6 +5,7 @@ use std::os::unix::process::CommandExt;
 
 use anyhow::{Context, Result, bail};
 
+use inkling::doctor;
 use inkling::history;
 use inkling::init;
 use inkling::proxy::{self, Settings};
@@ -56,8 +57,9 @@ fn init_shell(shell: &OsStr) -> Result<i32> {
 }
 
 fn doctor() -> Result<i32> {
-    out::line("doctor is not written yet")?;
-    Ok(0)
+    let report = doctor::examine(&history::Env::from_process());
+    out::text(&report.to_string())?;
+    Ok(i32::from(!report.all_well()))
 }
 
 /// Pull `--arg0 NAME` off the front, then an optional `--`.
