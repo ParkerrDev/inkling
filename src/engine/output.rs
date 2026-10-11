@@ -39,6 +39,9 @@ impl<S: Suggest> Engine<S> {
             self.finish_probe(now, tty, out);
         }
         self.check_front(tty);
+        if std::mem::take(&mut self.pump_due) {
+            self.pump(now, tty, out);
+        }
     }
 
     /// Time has passed with nothing else to do.
@@ -98,11 +101,25 @@ impl<S: Suggest> Engine<S> {
         if matches!(self.phase, Phase::Prompt(_)) {
             self.column.feed(bytes);
         }
+        if self.probing() && self.held.len().saturating_add(bytes.len()) > super::HELD_LIMIT {
+            self.abandon_probe(out);
+        }
         if self.probing() {
             self.held.extend_from_slice(bytes);
         } else {
             self.release(bytes, out);
         }
+    }
+
+    /// Stop holding output back: let go of it, and take the probe for lost.
+    fn abandon_probe(&mut self, out: &mut Out) {
+        self.release_held(out);
+        if let Phase::Prompt(prompt) = &mut self.phase {
+            prompt.probe = Probe::Idle;
+            prompt.quarantine();
+            prompt.line = Line::Unknown;
+        }
+        self.pump_due = true;
     }
 
     fn mark(&mut self, now: Instant, mark: Mark, out: &mut Out) {
@@ -195,6 +212,7 @@ impl<S: Suggest> Engine<S> {
     /// The report is in and the redraw has settled: show what was held, draw
     /// the suggestion, and go on with the keys that waited.
     fn finish_probe(&mut self, now: Instant, tty: &dyn Tty, out: &mut Out) {
+        debug_assert!(self.probing(), "only a probe that is out is finished");
         self.release_held(out);
         if let Phase::Prompt(prompt) = &mut self.phase {
             prompt.probe = Probe::Idle;

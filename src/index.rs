@@ -214,6 +214,11 @@ impl Index {
             at = at.saturating_add(run);
         }
         self.merge(fresh);
+        debug_assert_eq!(
+            self.sorted.len(),
+            self.recent.len(),
+            "the two lists stay in step"
+        );
         self.refresh_local();
     }
 
@@ -328,6 +333,10 @@ impl Index {
             from = from.saturating_add(1);
         }
         let end = low.saturating_add(run);
+        debug_assert!(
+            from <= end && end <= ids.len(),
+            "the run is inside the list"
+        );
         let stretch = when.get(from..end)?;
         let (offset, _) = stretch.iter().enumerate().max_by_key(|&(_, when)| *when)?;
         let id = *ids.get(from.saturating_add(offset))?;

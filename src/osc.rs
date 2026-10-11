@@ -119,6 +119,7 @@ impl Filter {
                 State::Header(held) => self.header_step(input, at, held, clean),
                 State::Body | State::BodyEscape => self.body(input, at, clean.len(), found),
             };
+            debug_assert!(at <= input.len(), "a step went past the input");
         }
     }
 

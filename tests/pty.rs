@@ -799,6 +799,30 @@ mod tests {
     }
 
     #[test]
+    fn the_doctor_knows_when_it_is_run_inside_the_proxy() {
+        let (_sandbox, mut shell) = shell_with_history();
+        shell.command("inkling doctor | grep 'this shell is wrapped'");
+        assert!(
+            shell.wait_text("yes, under the proxy"),
+            "{}",
+            shell.screen.text()
+        );
+    }
+
+    #[test]
+    fn with_no_history_at_all_the_session_still_learns() {
+        let sandbox = Sandbox::new();
+        let mut shell = sandbox.shell("");
+        shell.type_and_settle(b"echo");
+        assert_eq!(shell.dim_on_cursor_row(), "");
+        shell.type_and_settle(b" hi");
+        shell.send(b"\r");
+        shell.wait_prompt();
+        shell.type_and_settle(b"echo");
+        assert_eq!(shell.dim_on_cursor_row(), " hi");
+    }
+
+    #[test]
     fn the_doctor_fails_when_there_is_no_history() {
         let sandbox = Sandbox::new();
         let (well, report) = doctor(&sandbox);
@@ -1055,21 +1079,39 @@ mod atuin {
         let plain_screen = plain.screen.text();
         drop(plain);
         let mut shell = start_whole_stack(&sandbox, &[]);
-        assert_eq!(shell.screen.text(), plain_screen, "the first prompt is the same");
+        assert_eq!(
+            shell.screen.text(),
+            plain_screen,
+            "the first prompt is the same"
+        );
 
         shell.type_and_settle(b"echo f");
-        assert!(shell.cursor_row().ends_with("echo first"), "{}", shell.screen.text());
+        assert!(
+            shell.cursor_row().ends_with("echo first"),
+            "{}",
+            shell.screen.text()
+        );
         assert_eq!(shell.dim_on_cursor_row(), "irst", "{}", shell.screen.text());
         shell.type_and_settle(b"\x1b[C");
-        assert!(shell.cursor_row().ends_with("echo first"), "{}", shell.screen.text());
+        assert!(
+            shell.cursor_row().ends_with("echo first"),
+            "{}",
+            shell.screen.text()
+        );
         shell.send(b"\r");
         assert!(shell.wait_text("first\n"), "{}", shell.screen.text());
-        shell.wait_for(Duration::from_secs(5), |s| s.row(s.cursor().1).contains('\u{276f}'));
+        shell.wait_for(Duration::from_secs(5), |s| {
+            s.row(s.cursor().1).contains('\u{276f}')
+        });
         shell.settle(Duration::from_millis(300));
         // Tab completion, as it is without inkling.
         shell.type_and_settle(b"ls /usr/shar");
         shell.type_and_settle(b"\t");
-        assert!(shell.cursor_row().contains("/usr/share"), "{}", shell.screen.text());
+        assert!(
+            shell.cursor_row().contains("/usr/share"),
+            "{}",
+            shell.screen.text()
+        );
         shell.send(b"\x15");
         shell.settle(Duration::from_millis(200));
         // Atuin's search, and back.
@@ -1080,7 +1122,12 @@ mod atuin {
         shell.send(b"\x15");
         shell.settle(Duration::from_millis(200));
         shell.type_and_settle(b"echo s");
-        assert_eq!(shell.dim_on_cursor_row(), "econd", "{}", shell.screen.text());
+        assert_eq!(
+            shell.dim_on_cursor_row(),
+            "econd",
+            "{}",
+            shell.screen.text()
+        );
         shell.send(b"\x15exit\r");
         shell.exit_status(Duration::from_secs(10)).expect("exits");
     }

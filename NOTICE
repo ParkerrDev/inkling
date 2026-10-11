@@ -1,0 +1,22 @@
+inkling follows the behaviour of ble.sh's auto-complete in a few respects, and
+takes no code from it.
+
+ble.sh (https://github.com/akinomyoga/ble.sh) is
+Copyright (c) 2013, 2015-2023, K. Murase @akinomyoga <myoga.murase@gmail.com>,
+BSD 3-Clause "New" or "Revised" License.
+
+What was read in ble.sh (lib/core-complete.sh, the auto-complete section) and
+kept as behaviour, written again here in Rust and shell:
+
+  * A suggestion is made only when the cursor is at the end of a non-empty
+    line, and never for a command that is exactly what was typed.
+  * The keys that take it: Right and End and Ctrl-E take all of it; Alt-F and
+    Ctrl-Right take one word; Alt-Right takes a whitespace-delimited word and
+    the blanks around it (ble.sh's insert-word, whose rule is "blanks, then
+    the non-blanks, then blanks").
+  * Any other key withdraws the suggestion and is then handled as usual.
+  * The history is the source, the most recent command with the prefix first.
+
+No source text of ble.sh is in this repository, so none of its licence's
+conditions on redistribution apply; its notice is kept here as the credit it is
+due.

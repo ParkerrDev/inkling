@@ -48,6 +48,10 @@ const REPORT_TIMEOUT: Duration = Duration::from_millis(80);
 const PARTIAL_HOLD: Duration = Duration::from_millis(15);
 /// How long the start of a mark is kept back waiting for its end.
 const MARK_HOLD: Duration = Duration::from_millis(5);
+/// The most of the shell's output kept back while a probe is out. A shell
+/// that writes more than this between the probe and its report is not a
+/// shell at a prompt, and the probe is given up on.
+const HELD_LIMIT: usize = 1 << 20;
 /// The marker that ends a bracketed paste.
 const PASTE_END: &[u8] = b"\x1b[201~";
 
@@ -250,6 +254,9 @@ pub struct Engine<S> {
     shown: Option<String>,
     /// When output last ended inside the start of a mark.
     mark_since: Option<Instant>,
+    /// A probe was given up on for lack of room, and the keys that waited
+    /// for it are to be passed on.
+    pump_due: bool,
     /// The line, if it was known for certain, when the keys that ran it passed.
     submitted: Option<String>,
 }
@@ -270,6 +277,7 @@ impl<S: Suggest> Engine<S> {
             held: Vec::new(),
             shown: None,
             mark_since: None,
+            pump_due: false,
             submitted: None,
         }
     }

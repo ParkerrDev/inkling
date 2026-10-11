@@ -335,6 +335,7 @@ impl Column {
             self.at = self.cols.saturating_sub(1);
             self.pending = true;
         }
+        debug_assert!(self.at < self.cols.max(1), "the cursor is on the row");
     }
 }
 

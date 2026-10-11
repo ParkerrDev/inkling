@@ -138,6 +138,7 @@ impl Prompt {
                 break;
             }
         }
+        debug_assert!(at <= input.len(), "the pass read past its input");
         self.input = input;
         self.input.drain(..at.min(self.input.len()));
         flow

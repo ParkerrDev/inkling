@@ -778,6 +778,21 @@ fn the_start_of_a_mark_that_never_finishes_is_given_back() {
 }
 
 #[test]
+fn a_probe_that_is_answered_with_a_flood_is_given_up_on() {
+    let mut sim = Sim::new(&["git status"]);
+    sim.prompt();
+    sim.input(b"g");
+    sim.take_shell();
+    let flood = vec![b'x'; HELD_LIMIT];
+    sim.output(&flood);
+    sim.output(b"more");
+    assert_eq!(sim.take_terminal().len(), HELD_LIMIT.saturating_add(4));
+    assert!(!sim.engine.holds_input());
+    sim.input(b"i");
+    assert_eq!(sim.take_shell(), b"i", "no more probes at this prompt");
+}
+
+#[test]
 fn the_end_of_the_shell_lets_go_of_what_is_held() {
     let mut sim = Sim::new(&["git status"]);
     sim.prompt();

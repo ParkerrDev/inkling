@@ -21,12 +21,18 @@ if [[ $- == *i* && ${INKLING-} != 0 ]] &&
       # The environment goes along in a variable of its own, quoted one entry
       # to a line. It is read now: once this process has become the proxy,
       # /proc/$$/environ is the proxy's, not this shell's.
-      mapfile -d '' -t __inkling_environ </proc/$$/environ 2>/dev/null
-      printf -v __inkling_environ '%q\n' "${__inkling_environ[@]}"
+      mapfile -d '' -t __inkling_env </proc/$$/environ 2>/dev/null
+      __inkling_environ=
+      if ((${#__inkling_env[@]})); then
+        printf -v __inkling_environ '%q\n' "${__inkling_env[@]}"
+      fi
+      # Left out if it could not be read, and if it would be too long for a
+      # single variable: the shell then starts with this one's environment.
+      ((${#__inkling_environ} > 100000)) && __inkling_environ=
       # shellcheck disable=SC2093 # if the proxy cannot start, the shell goes on
       INKLING_ENVIRON=$__inkling_environ INKLING_HISTFILE=${HISTFILE-} \
         exec @INKLING@ run --arg0 "${__inkling_argv[0]}" -- "$BASH" "${__inkling_argv[@]:1}"
-      unset -v __inkling_argv __inkling_environ
+      unset -v __inkling_argv __inkling_env __inkling_environ
     fi
   elif [[ ${INKLING_SHELL_PID-} == "$$" ]]; then
     # The proxy's own shell. What it was given in the environment is kept as

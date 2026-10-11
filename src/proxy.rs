@@ -632,6 +632,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn nothing_readable_is_no_environment_at_all() {
+        assert_eq!(environment("").len(), 0);
+        assert_eq!(environment("''\n").len(), 0);
+        assert_eq!(environment("no equals sign\n").len(), 0);
+    }
+
+    #[test]
     fn an_environment_is_read_from_quoted_lines() {
         let vars =
             environment("A=1\nB=two\\ words\n$'C=with\\nnewline'\nEMPTY=\n=bad\nnoequals\nD=x=y\n");
