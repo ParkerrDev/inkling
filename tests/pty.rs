@@ -567,7 +567,7 @@ mod tests {
         assert!(output.status.success());
         assert_eq!(
             String::from_utf8(output.stdout).unwrap(),
-            inkling::init::bash()
+            inkling::init::bash_for(env!("CARGO_BIN_EXE_inkling"))
         );
     }
 

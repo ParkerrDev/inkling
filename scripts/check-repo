@@ -1,0 +1,25 @@
+#!/bin/bash
+# This repository's own checks beyond the Rust ones: CI runs it after
+# scripts/check-rust, which has already run every test cargo knows of,
+# including the end-to-end ones that drive bash and the proxy on a
+# pseudo-terminal. What needs a tool that is not there is skipped, and says so.
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+
+step() { printf '\033[1m==> %s\033[0m\n' "$*"; }
+
+step "the shell scripts, with shellcheck"
+if command -v shellcheck >/dev/null 2>&1; then
+  shellcheck -s bash src/init.bash install.sh uninstall.sh tests/install.sh scripts/measure
+  echo "clean"
+else
+  echo "shellcheck is not installed: skipped"
+fi
+
+step "the integration script is valid bash"
+bash -n src/init.bash
+
+step "install.sh and uninstall.sh, against a scratch home"
+tests/install.sh
+
+step "the repository's checks passed"

@@ -12,10 +12,24 @@ pub const PROBE_KEYS: &[u8] = b"\x18\x1fI\x07";
 /// The binding as the script writes it.
 pub const PROBE_BINDING: &str = r#""\C-x\C-_I\a""#;
 
-/// The integration for bash.
+/// The integration for bash, as it is kept.
 #[must_use]
 pub fn bash() -> &'static str {
     include_str!("init.bash")
+}
+
+/// The integration for bash, for the program at `exe`: wherever the script
+/// starts the proxy it names that program by its full path, so that it does
+/// not depend on `PATH` being set up by the time the shell reads its startup
+/// file.
+#[must_use]
+pub fn bash_for(exe: &str) -> String {
+    bash().replace("@INKLING@", &shell_quote(exe))
+}
+
+/// `text` as one word of shell, in single quotes.
+fn shell_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
 }
 
 #[cfg(test)]
@@ -34,6 +48,14 @@ mod tests {
         assert!(script.contains(r"'\e]7777;%s;P;%s\a'"));
         assert!(script.contains(r"'\e]7777;%s;L;%d;%d;%q\a'"));
         assert!(script.contains(r"$'\e]7777;'$__inkling_nonce$';R\a'"));
+    }
+
+    #[test]
+    fn the_program_is_named_by_its_full_path_and_quoted() {
+        let script = bash_for("/home/a b/it's/inkling");
+        assert!(!script.contains("@INKLING@"));
+        assert!(script.contains(r"[[ -x '/home/a b/it'\''s/inkling' ]]"));
+        assert!(script.contains(r"exec '/home/a b/it'\''s/inkling' run --arg0"));
     }
 
     #[test]

@@ -1,5 +1,7 @@
 # inkling: fish-like suggestions for bash. Printed by `inkling init bash`; put
 # this in ~/.bashrc as   eval "$(inkling init bash)"   (install.sh does).
+# Where the program is named below, it is by the full path of the one that
+# printed this.
 #
 # It runs in two places. In the first shell it starts the proxy once, on a real
 # terminal, and the shell becomes that proxy's child; in that child it
@@ -13,7 +15,7 @@ if [[ $- == *i* && ${INKLING-} != 0 ]] &&
     # its command line, and the environment it began with (terminals that
     # add their own shell integration do it through both, and a variable set
     # since would be set twice).
-    if [[ -t 0 && -t 1 && -t 2 && ${TERM-dumb} != dumb ]] && command -v inkling >/dev/null 2>&1; then
+    if [[ -t 0 && -t 1 && -t 2 && ${TERM-dumb} != dumb ]] && [[ -x @INKLING@ ]]; then
       mapfile -d '' -t __inkling_argv </proc/$$/cmdline 2>/dev/null
       ((${#__inkling_argv[@]})) || __inkling_argv=("$0")
       # The environment goes along in a variable of its own, quoted one entry
@@ -23,7 +25,7 @@ if [[ $- == *i* && ${INKLING-} != 0 ]] &&
       printf -v __inkling_environ '%q\n' "${__inkling_environ[@]}"
       # shellcheck disable=SC2093 # if the proxy cannot start, the shell goes on
       INKLING_ENVIRON=$__inkling_environ INKLING_HISTFILE=${HISTFILE-} \
-        exec inkling run --arg0 "${__inkling_argv[0]}" -- "$BASH" "${__inkling_argv[@]:1}"
+        exec @INKLING@ run --arg0 "${__inkling_argv[0]}" -- "$BASH" "${__inkling_argv[@]:1}"
       unset -v __inkling_argv __inkling_environ
     fi
   elif [[ ${INKLING_SHELL_PID-} == "$$" ]]; then

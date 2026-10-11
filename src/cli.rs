@@ -52,7 +52,9 @@ fn init_shell(shell: &OsStr) -> Result<i32> {
     if shell != "bash" {
         bail!("only bash is supported so far, not {}", shell.display());
     }
-    out::text(init::bash())?;
+    // The program names itself in the script by its full path.
+    let exe = std::env::current_exe().context("find this program")?;
+    out::text(&init::bash_for(&exe.to_string_lossy()))?;
     Ok(0)
 }
 
