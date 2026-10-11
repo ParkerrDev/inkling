@@ -188,12 +188,41 @@ fn the_suggestion_is_drawn_after_the_redraw_in_one_go() {
 }
 
 #[test]
-fn nothing_reaches_the_terminal_until_the_redraw_has_settled() {
+fn the_suggestion_comes_as_soon_as_the_redraw_ends_with_the_line() {
     let mut sim = Sim::new(&["git status"]);
     sim.prompt();
     sim.input(b"g");
     sim.output(b"g");
     sim.output(&reply("g", 1));
+    let mut expect = b"g\r\x1b[K\rP> g".to_vec();
+    expect.extend(drawn("it status"));
+    assert_eq!(sim.take_terminal(), expect, "no waiting");
+    assert!(!sim.engine.holds_input());
+}
+
+#[test]
+fn when_the_end_of_the_redraw_cannot_be_told_it_is_waited_for() {
+    let mut sim = Sim::new(&["git status"]);
+    sim.prompt();
+    sim.input(b"\x7f");
+    sim.output(b"\x08");
+    sim.output(&reply("", 0));
+    assert_eq!(sim.take_terminal(), b"", "held while more may come");
+    sim.output(b"");
+    sim.wait(1);
+    assert_eq!(sim.take_terminal(), b"\x08\r\x1b[K\rP> ");
+}
+
+#[test]
+fn more_output_after_the_report_extends_the_wait() {
+    let mut sim = Sim::new(&["git status"]);
+    sim.prompt();
+    sim.input(b"\x7f");
+    sim.output(&reply("", 0));
+    sim.wait(0);
+    assert_eq!(sim.take_terminal(), b"");
+    sim.output(b"x");
+    sim.wait(0);
     assert_eq!(sim.take_terminal(), b"");
     sim.wait(1);
     assert_ne!(sim.take_terminal().len(), 0);

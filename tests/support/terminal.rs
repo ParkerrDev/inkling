@@ -199,6 +199,37 @@ impl Terminal {
         }
     }
 
+    /// Type `bytes` in one write and say how long it was until the first
+    /// output came back. Reads what is there afterwards.
+    pub fn type_timed(&mut self, bytes: &[u8]) -> Duration {
+        let started = Instant::now();
+        let written = rustix::io::write(&self.master, bytes).unwrap();
+        assert_eq!(written, bytes.len());
+        let mut fds = [PollFd::new(&self.master, PollFlags::IN)];
+        let timeout = Timespec { tv_sec: 2, tv_nsec: 0 };
+        poll(&mut fds, Some(&timeout)).unwrap();
+        let first = started.elapsed();
+        self.pump(Duration::ZERO);
+        first
+    }
+
+    /// The process id of what was started, which is the proxy once the
+    /// shell has handed over to it.
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// Wait for the first prompt, without waiting any longer than that.
+    pub fn wait_prompt_start(&mut self) -> Instant {
+        let came = self.wait_for(Duration::from_secs(10), |screen| {
+            screen.row(screen.cursor().1) == "$"
+        });
+        let at = Instant::now();
+        assert!(came, "no prompt came:\n{}", self.screen.all_text());
+        self.settle(Duration::from_millis(100));
+        at
+    }
+
     /// Run a command line and wait for the prompt to come back.
     pub fn command(&mut self, line: &str) {
         let mut bytes = line.as_bytes().to_vec();

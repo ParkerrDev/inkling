@@ -37,8 +37,9 @@ use crate::quote;
 use crate::render::{self, Style};
 use crate::text;
 
-/// How long after the report to wait for the rest of readline's redraw.
-const SETTLE: Duration = Duration::from_micros(300);
+/// How long after the report to wait for the rest of readline's redraw, when
+/// there is no telling it is complete.
+const SETTLE: Duration = Duration::from_micros(200);
 /// The longest the redraw is waited for, however it trickles in.
 const SETTLE_LIMIT: Duration = Duration::from_millis(4);
 /// How long a probe may go unanswered before it is given up on.
@@ -133,8 +134,13 @@ enum Probe {
     Idle,
     /// Sent at this time; no report yet.
     Waiting { since: Instant },
-    /// Reported; waiting for readline's redraw to finish arriving.
-    Settling { until: Instant, limit: Instant },
+    /// Reported; waiting for readline's redraw to finish arriving. The held
+    /// output was this long when the report came.
+    Settling {
+        until: Instant,
+        limit: Instant,
+        report_at: usize,
+    },
 }
 
 /// Whether the shell is known to be somewhere a probe is safe.

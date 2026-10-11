@@ -457,6 +457,57 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_c_and_ctrl_l_leave_the_next_prompt_working() {
+        let (_sandbox, mut shell) = shell_with_history();
+        shell.type_and_settle(b"git");
+        assert_eq!(shell.dim_on_cursor_row(), " status");
+        shell.send(b"\x03");
+        shell.wait_prompt();
+        assert!(!shell.screen.any_dim(), "{}", shell.screen.text());
+        shell.type_and_settle(b"git");
+        assert_eq!(shell.dim_on_cursor_row(), " status");
+        shell.type_and_settle(b"\x0c");
+        assert_eq!(shell.cursor_row(), "$ git");
+        shell.type_and_settle(b" ");
+        assert_eq!(shell.dim_on_cursor_row(), "status");
+    }
+
+    #[test]
+    fn a_suggestion_that_would_run_past_the_row_is_cut_and_taken_whole() {
+        let sandbox = Sandbox::new();
+        let long = format!("echo {}", "0123456789".repeat(12));
+        sandbox.write_history(&[long.as_str()]);
+        let mut shell = sandbox.shell("");
+        shell.type_and_settle(b"echo 0123456789012345678901234567890123456789");
+        let row = shell.cursor_row();
+        assert!(row.starts_with("$ echo 0123"), "{row}");
+        let dim = shell.dim_on_cursor_row();
+        assert!(dim.ends_with('\u{2026}'), "{dim:?}");
+        // Nothing wrapped: the suggestion stayed on its row, and the cursor
+        // stayed at the end of what was typed.
+        assert_eq!(shell.screen.cursor(), ("$ echo 0123456789012345678901234567890123456789".len(), 0));
+        assert_eq!(shell.screen.row(1), "");
+        shell.type_and_settle(b"\x1b[C");
+        assert_eq!(
+            shell.screen.all_text().replace('\n', ""),
+            format!("$ {long}"),
+            "taken whole, over two rows"
+        );
+        assert_eq!(shell.dim_on_cursor_row(), "");
+    }
+
+    #[test]
+    fn a_resize_at_the_prompt_leaves_it_working() {
+        let (_sandbox, mut shell) = shell_with_history();
+        shell.type_and_settle(b"git");
+        shell.resize(30, 60);
+        shell.settle(Duration::from_millis(150));
+        assert!(!shell.screen.any_dim(), "{}", shell.screen.text());
+        shell.type_and_settle(b" ");
+        assert_eq!(shell.dim_on_cursor_row(), "status");
+    }
+
+    #[test]
     fn the_integration_text_the_program_prints_is_the_one_in_the_library() {
         let output = std::process::Command::new(env!("CARGO_BIN_EXE_inkling"))
             .args(["init", "bash"])
@@ -744,5 +795,168 @@ mod atuin {
         shell.type_and_settle(b"echo f");
         assert_eq!(shell.dim_on_cursor_row(), "irst", "{}", shell.screen.text());
         leave(shell);
+    }
+}
+
+/// Measurements, not checks: run by `scripts/measure`, in a release build,
+/// one at a time.
+#[cfg(test)]
+mod measure {
+    use std::time::{Duration, Instant};
+
+    use super::support::sandbox::Sandbox;
+    use super::support::terminal::Terminal;
+
+    fn median(times: &mut [Duration]) -> Duration {
+        times.sort_unstable();
+        times.get(times.len() / 2).copied().unwrap_or_default()
+    }
+
+    fn percentile(times: &mut [Duration], per_cent: usize) -> Duration {
+        times.sort_unstable();
+        let at = (times.len() * per_cent / 100).min(times.len().saturating_sub(1));
+        times.get(at).copied().unwrap_or_default()
+    }
+
+    fn micros(time: Duration) -> String {
+        format!("{:7.0} us", time.as_secs_f64() * 1e6)
+    }
+
+    fn summary(label: &str, mut times: Vec<Duration>) -> Duration {
+        let middle = median(&mut times);
+        let worst = times.iter().max().copied().unwrap_or_default();
+        eprintln!(
+            "{label:36} median {}  p95 {}  worst {}  over {} keys",
+            micros(middle),
+            micros(percentile(&mut times, 95)),
+            micros(worst),
+            times.len()
+        );
+        middle
+    }
+
+    const PATTERN: &[u8] = b"git status -sb";
+
+    /// Time from each key to the first byte back, typing one key at a time
+    /// with the shell idle between.
+    fn key_times(shell: &mut Terminal, keys: usize) -> Vec<Duration> {
+        let mut times = Vec::new();
+        for n in 0..keys {
+            let at = n % PATTERN.len();
+            if at == 0 {
+                shell.send(b"\x15");
+                shell.settle(Duration::from_millis(30));
+            }
+            let key = PATTERN.get(at).copied().unwrap();
+            times.push(shell.type_timed(&[key]));
+            shell.settle(Duration::from_millis(25));
+        }
+        times
+    }
+
+    fn history() -> Vec<&'static str> {
+        vec![
+            "git status -sb --short",
+            "git stash",
+            "ls -la /tmp",
+            "echo hello world",
+        ]
+    }
+
+    #[test]
+    #[ignore = "a measurement: scripts/measure"]
+    fn keystroke_latency() {
+        let bare = Sandbox::new();
+        bare.write_history(&history());
+        let mut shell = bare.start(&bare.bare_rc(), &[]);
+        let _ = shell.wait_prompt_start();
+        let plain = summary("echo, bash alone", key_times(&mut shell, 300));
+        drop(shell);
+
+        let with = Sandbox::new();
+        with.write_history(&history());
+        let mut shell = with.shell("");
+        let wrapped = summary("echo and suggestion, with inkling", key_times(&mut shell, 300));
+        eprintln!(
+            "added by inkling, medians: {}",
+            micros(wrapped.saturating_sub(plain))
+        );
+    }
+
+    #[test]
+    #[ignore = "a measurement: scripts/measure"]
+    fn startup_cost() {
+        let time = |wrapped: bool| {
+            let mut times = Vec::new();
+            for _ in 0..15 {
+                let sandbox = Sandbox::new();
+                sandbox.write_history(&history());
+                let rc = if wrapped {
+                    sandbox.rc_around("", "")
+                } else {
+                    sandbox.bare_rc()
+                };
+                let started = Instant::now();
+                let mut shell = sandbox.start(&rc, &[]);
+                let came = shell.wait_prompt_start();
+                times.push(came.duration_since(started));
+            }
+            times
+        };
+        let plain = median(&mut time(false));
+        let mut wrapped_times = time(true);
+        let wrapped = median(&mut wrapped_times);
+        let millis = |t: Duration| format!("{:6.1} ms", t.as_secs_f64() * 1e3);
+        eprintln!("shell start to first prompt, bash alone:    median {}", millis(plain));
+        eprintln!("shell start to first prompt, with inkling:  median {}", millis(wrapped));
+        eprintln!("added by inkling:                           {}", millis(wrapped.saturating_sub(plain)));
+        let mut inits = Vec::new();
+        for _ in 0..50 {
+            let started = Instant::now();
+            let output = std::process::Command::new(env!("CARGO_BIN_EXE_inkling"))
+                .args(["init", "bash"])
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            inits.push(started.elapsed());
+        }
+        eprintln!("`inkling init bash`, run and read:         median {}", millis(median(&mut inits)));
+    }
+
+    fn rss(pid: u32) -> (u64, u64) {
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+        let kib = |name: &str| {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix(name))
+                .and_then(|rest| rest.split_whitespace().next())
+                .and_then(|n| n.parse::<u64>().ok())
+                .unwrap_or(0)
+        };
+        (kib("VmRSS:"), kib("VmHWM:"))
+    }
+
+    #[test]
+    #[ignore = "a measurement: scripts/measure"]
+    fn memory_and_load_time() {
+        for rows in [0_usize, 10_000, 100_000, 400_000] {
+            let sandbox = Sandbox::new();
+            if rows > 0 {
+                sandbox.big_atuin_db(rows);
+            } else {
+                sandbox.write_history(&history());
+            }
+            let started = Instant::now();
+            let mut shell = sandbox.start(&sandbox.rc_around("", ""), &[]);
+            let up = shell.wait_prompt_start().duration_since(started);
+            shell.type_and_settle(b"git --option1");
+            let (now, peak) = rss(shell.pid());
+            eprintln!(
+                "{rows:7} runs in history: proxy resident {:6.1} MiB (peak {:6.1} MiB); prompt after {:5.0} ms",
+                now as f64 / 1024.0,
+                peak as f64 / 1024.0,
+                up.as_secs_f64() * 1e3
+            );
+        }
     }
 }

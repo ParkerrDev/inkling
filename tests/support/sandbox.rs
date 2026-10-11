@@ -74,6 +74,30 @@ impl Sandbox {
         .to_vec()
     }
 
+    /// The shell set-up with no inkling in it at all.
+    pub fn bare_rc(&self) -> PathBuf {
+        let rc = self.home().join("bare.sh");
+        let body = format!(
+            "PS1='$ '\nunset PROMPT_COMMAND\nHISTFILE={}\nHISTCONTROL=ignoreboth\n",
+            self.histfile().display()
+        );
+        std::fs::write(&rc, body).unwrap();
+        rc
+    }
+
+    /// Start bash on this rc and return at once, before any prompt.
+    pub fn start(&self, rc: &Path, env: &[(&str, &str)]) -> Terminal {
+        let argv = Self::bash_argv(rc);
+        let mut vars = self.env();
+        vars.extend(env.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())));
+        Terminal::start(&Launch {
+            argv: &argv,
+            env: vars,
+            dir: &self.home(),
+            size: (ROWS, COLS),
+        })
+    }
+
     /// An interactive bash with inkling, at its first prompt.
     pub fn shell(&self, extra_rc: &str) -> Terminal {
         self.shell_with(extra_rc, &[])
@@ -115,6 +139,31 @@ impl Sandbox {
         .unwrap();
     }
 
+    /// An Atuin database with `rows` runs of made-up commands, about three in
+    /// ten of them different.
+    pub fn big_atuin_db(&self, rows: usize) -> PathBuf {
+        let mut seed: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut next = move |bound: u64| {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            seed.checked_shr(33).unwrap_or(0).checked_rem(bound).unwrap_or(0)
+        };
+        let tools = ["git", "cargo", "ls", "cd", "docker", "kubectl", "make", "npm", "ssh", "grep"];
+        let commands: Vec<(String, String)> = (0..rows)
+            .map(|_| {
+                let tool = tools[usize::try_from(next(10)).unwrap()];
+                let command = format!(
+                    "{tool} --option{} subcommand{} /path/to/some/where/{}",
+                    next(40),
+                    next(300),
+                    next(30)
+                );
+                (command, format!("/home/dir{}", next(60)))
+            })
+            .collect();
+        let pairs: Vec<(&str, &str)> = commands.iter().map(|(c, d)| (c.as_str(), d.as_str())).collect();
+        self.atuin_db(&pairs)
+    }
+
     /// An Atuin database as Atuin makes one, with these commands, oldest
     /// first, each run in the directory given.
     pub fn atuin_db(&self, commands: &[(&str, &str)]) -> PathBuf {
@@ -131,6 +180,7 @@ impl Sandbox {
              CREATE INDEX idx_history_timestamp ON history(timestamp);",
         )
         .unwrap();
+        conn.execute_batch("BEGIN").unwrap();
         for (n, (command, cwd)) in commands.iter().enumerate() {
             conn.execute(
                 "INSERT INTO history (id, timestamp, duration, exit, command, cwd, session, hostname)
@@ -139,6 +189,7 @@ impl Sandbox {
             )
             .unwrap();
         }
+        conn.execute_batch("COMMIT").unwrap();
         path
     }
 }

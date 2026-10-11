@@ -35,6 +35,9 @@ impl<S: Suggest> Engine<S> {
         self.clean = clean;
         self.found = found;
         self.more_output(now);
+        if self.redraw_done() {
+            self.finish_probe(now, tty, out);
+        }
         self.check_front(tty);
     }
 
@@ -54,7 +57,7 @@ impl<S: Suggest> Engine<S> {
             return;
         };
         match prompt.probe {
-            Probe::Settling { until, limit } if now >= until || now >= limit => {
+            Probe::Settling { until, limit, .. } if now >= until || now >= limit => {
                 self.finish_probe(now, tty, out);
             }
             Probe::Waiting { since } if now >= after(since, REPORT_TIMEOUT) => {
@@ -68,11 +71,14 @@ impl<S: Suggest> Engine<S> {
     /// Output carries on after the report: wait for the end of it.
     fn more_output(&mut self, now: Instant) {
         if let Phase::Prompt(prompt) = &mut self.phase
-            && let Probe::Settling { limit, .. } = prompt.probe
+            && let Probe::Settling {
+                limit, report_at, ..
+            } = prompt.probe
         {
             prompt.probe = Probe::Settling {
                 until: after(now, SETTLE).min(limit),
                 limit,
+                report_at,
             };
         }
     }
@@ -154,7 +160,30 @@ impl<S: Suggest> Engine<S> {
         prompt.probe = Probe::Settling {
             until: after(now, SETTLE),
             limit: after(now, SETTLE_LIMIT),
+            report_at: self.held.len(),
         };
+    }
+
+    /// With the line known and the cursor at its end, readline's redraw ends
+    /// with the line itself, so when the held output ends that way there is
+    /// nothing more to wait for. Where this cannot tell (an empty line, a
+    /// cursor inside the line, a line that wraps), the wait is a short time.
+    fn redraw_done(&self) -> bool {
+        let Phase::Prompt(prompt) = &self.phase else {
+            return false;
+        };
+        let Probe::Settling { report_at, .. } = prompt.probe else {
+            return false;
+        };
+        let Line::Known { text, at_end: true } = &prompt.line else {
+            return false;
+        };
+        !text.is_empty()
+            && !text.chars().any(char::is_control)
+            && self
+                .held
+                .get(report_at..)
+                .is_some_and(|redraw| redraw.ends_with(text.as_bytes()))
     }
 
     /// The report is in and the redraw has settled: show what was held, draw
