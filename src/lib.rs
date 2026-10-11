@@ -11,9 +11,11 @@
 //! `main.rs` is a thin face over it.
 
 pub mod column;
+pub mod engine;
 pub mod error;
 pub mod history;
 pub mod index;
+pub mod init;
 pub mod keys;
 pub mod osc;
 pub mod quote;
