@@ -220,7 +220,10 @@ mod tests {
             seed = seed
                 .wrapping_mul(6_364_136_223_846_793_005)
                 .wrapping_add(1_442_695_040_888_963_407);
-            usize::try_from(seed.checked_shr(33).unwrap_or(0)).unwrap() % bound
+            usize::try_from(seed.checked_shr(33).unwrap_or(0))
+                .unwrap()
+                .checked_rem(bound)
+                .unwrap_or(0)
         };
         let words = [
             "git",
@@ -248,7 +251,7 @@ mod tests {
             let mut sample = Vec::new();
             for _ in 0..=next(10) {
                 if next(3) == 0 {
-                    sample.push(u8::try_from(1 + next(255)).unwrap());
+                    sample.push(u8::try_from(next(255).saturating_add(1)).unwrap());
                 } else {
                     sample.extend_from_slice(words[next(words.len())].as_bytes());
                     sample.push(b' ');

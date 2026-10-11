@@ -1191,7 +1191,7 @@ mod measure {
                 "{label:14} {} MiB of output in {:5.0} ms, {:6.0} MiB/s",
                 bytes / (1024 * 1024),
                 took.as_secs_f64() * 1e3,
-                f64::from(u32::try_from(bytes).unwrap()) / 1048576.0 / took.as_secs_f64()
+                f64::from(u32::try_from(bytes).unwrap()) / 1_048_576.0 / took.as_secs_f64()
             );
         }
     }
