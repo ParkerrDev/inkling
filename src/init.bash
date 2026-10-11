@@ -46,12 +46,16 @@ if [[ $- == *i* && ${INKLING-} != 0 ]] &&
     # A command is about to run.
     PS0=${PS0-}$'\e]7777;'$__inkling_nonce$';R\a'
 
-    # PROMPT_COMMAND is an array in some setups and a string in others.
+    # PROMPT_COMMAND is an array in some setups and a string in others. The
+    # hook goes first, not last: bash-preexec, which Atuin uses, ends its own
+    # prompt command with a marker meaning "the next command is the person's",
+    # and any command that runs after it would be taken for the person's.
+    # The hook leaves $? as it found it, so that what follows sees it.
     if [[ ${PROMPT_COMMAND@a} == *a* ]]; then
-      PROMPT_COMMAND+=(__inkling_prompt)
+      PROMPT_COMMAND=(__inkling_prompt "${PROMPT_COMMAND[@]}")
     else
       # shellcheck disable=SC2178,SC2128 # a string here, as the test above found
-      PROMPT_COMMAND=${PROMPT_COMMAND:+$PROMPT_COMMAND$'\n'}__inkling_prompt
+      PROMPT_COMMAND=__inkling_prompt${PROMPT_COMMAND:+$'\n'$PROMPT_COMMAND}
     fi
   fi
 fi

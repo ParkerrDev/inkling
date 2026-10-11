@@ -23,13 +23,13 @@ use rustix::io::Errno;
 use rustix::process::Pid;
 use rustix::stdio::{stdin, stdout};
 use rustix::termios::{
-    LocalModes, OptionalActions, Termios, Winsize, isatty, tcgetattr, tcgetpgrp, tcgetwinsize,
-    tcsetattr, tcsetwinsize,
+    LocalModes, OptionalActions, OutputModes, Termios, Winsize, isatty, tcgetattr, tcgetpgrp,
+    tcgetwinsize, tcsetattr, tcsetwinsize,
 };
 use signal_hook::consts::{SIGCHLD, SIGHUP, SIGINT, SIGQUIT, SIGTERM, SIGWINCH};
 
 use crate::brain::Brain;
-use crate::engine::{Engine, Event, Out, Tty};
+use crate::engine::{Engine, Event, Mode, Out, Tty};
 use crate::error::{Error, Result};
 use crate::history;
 use crate::pty::{self, Pty};
@@ -228,12 +228,21 @@ impl Tty for Facts<'_> {
         tcgetpgrp(self.master).is_ok_and(|group| group == self.shell)
     }
 
-    fn readline_mode(&self) -> bool {
-        tcgetattr(self.master).is_ok_and(|modes| {
-            !modes
-                .local_modes
-                .intersects(LocalModes::ICANON | LocalModes::ECHO)
-        })
+    fn mode(&self) -> Mode {
+        let Ok(settings) = tcgetattr(self.master) else {
+            return Mode::Other;
+        };
+        let local = settings.local_modes;
+        if local.contains(LocalModes::ICANON | LocalModes::ECHO) {
+            Mode::Cooked
+        } else if !local.intersects(LocalModes::ICANON | LocalModes::ECHO)
+            && local.contains(LocalModes::ISIG)
+            && settings.output_modes.contains(OutputModes::OPOST)
+        {
+            Mode::Readline
+        } else {
+            Mode::Other
+        }
     }
 }
 

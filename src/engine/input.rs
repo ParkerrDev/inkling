@@ -1,8 +1,8 @@
 //! The person's side: keys on their way to the shell.
 
 use super::{
-    Batch, Ctx, Engine, Flow, Instant, Line, Out, PASTE_END, PROBE_KEYS, Phase, Probe, Prompt,
-    Safety, Suggest, Tty,
+    Batch, Ctx, Engine, Flow, Instant, Line, Mode, Out, PASTE_END, PROBE_KEYS, Phase, Probe,
+    Prompt, Safety, Suggest, Tty,
 };
 use crate::keys::{self, Accept, Key, Token};
 use crate::text;
@@ -43,11 +43,12 @@ impl<S: Suggest> Engine<S> {
         if prompt.disabled {
             return;
         }
-        if !tty.shell_in_front() {
+        let mode = tty.mode();
+        if !tty.shell_in_front() || mode == Mode::Other {
             prompt.safety = Safety::Quarantined { foreign_seen: true };
             prompt.line = Line::Unknown;
         } else if prompt.safety == (Safety::Quarantined { foreign_seen: true })
-            && tty.readline_mode()
+            && mode == Mode::Readline
         {
             prompt.safety = Safety::Clear;
             prompt.line = Line::Unknown;
@@ -58,7 +59,7 @@ impl<S: Suggest> Engine<S> {
     /// due. Does nothing while a probe is out.
     pub(super) fn pump(&mut self, now: Instant, tty: &dyn Tty, out: &mut Out) {
         self.check_front(tty);
-        let ready = tty.shell_in_front() && tty.readline_mode();
+        let ready = tty.shell_in_front() && tty.mode() == Mode::Readline;
         let Self {
             phase,
             shown,

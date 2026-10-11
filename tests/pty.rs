@@ -500,3 +500,184 @@ mod tests {
         assert_eq!(status.code(), Some(42));
     }
 }
+
+#[cfg(test)]
+mod atuin {
+    use std::path::Path;
+    use std::time::{Duration, Instant};
+
+    use super::support::sandbox::Sandbox;
+    use super::support::terminal::Terminal;
+
+    const PREEXEC: &str = "/usr/share/bash-preexec/bash-preexec.sh";
+
+    fn available() -> bool {
+        let has_atuin = std::env::var_os("PATH").is_some_and(|paths| {
+            std::env::split_paths(&paths).any(|dir| dir.join("atuin").is_file())
+        });
+        has_atuin && Path::new(PREEXEC).is_file()
+    }
+
+    fn setup() -> String {
+        format!("source {PREEXEC}\neval \"$(atuin init bash)\"")
+    }
+
+    fn recorded(sandbox: &Sandbox) -> Vec<String> {
+        let path = sandbox.home().join(".local/share/atuin/history.db");
+        let Ok(conn) = rusqlite::Connection::open(path) else {
+            return Vec::new();
+        };
+        let Ok(mut statement) = conn.prepare("SELECT command FROM history ORDER BY timestamp")
+        else {
+            return Vec::new();
+        };
+        statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map(|rows| rows.filter_map(Result::ok).collect())
+            .unwrap_or_default()
+    }
+
+    /// A session that runs some commands, so that Atuin has a database with
+    /// them in it before the session under test begins.
+    fn warm_up(sandbox: &Sandbox, before: &str, after: &str) {
+        let mut shell = sandbox.shell_around(before, after, &[]);
+        for command in ["true", "echo first", "echo second"] {
+            shell.command(command);
+        }
+        shell.send(b"exit\r");
+        shell.exit_status(Duration::from_secs(10)).expect("exits");
+        let started = Instant::now();
+        while !recorded(sandbox).contains(&"echo second".to_owned()) {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "{:?}",
+                recorded(sandbox)
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+
+    fn leave(mut shell: Terminal) {
+        shell.send(b"\x15exit\r");
+        shell.exit_status(Duration::from_secs(10)).expect("exits");
+    }
+
+    #[test]
+    fn bash_preexec_sees_every_command_with_inkling_before_or_after_it() {
+        if !Path::new(PREEXEC).is_file() {
+            eprintln!("no bash-preexec here: skipped");
+            return;
+        }
+        for inkling_first in [true, false] {
+            let sandbox = Sandbox::new();
+            let log = sandbox.home().join("preexec.log");
+            let hook = format!(
+                "source {PREEXEC}\npreexec() {{ printf '%s\\n' \"$1\" >> {}; }}",
+                log.display()
+            );
+            let (before, after) = if inkling_first {
+                (String::new(), hook)
+            } else {
+                (hook, String::new())
+            };
+            let mut shell = sandbox.shell_around(&before, &after, &[]);
+            shell.command("echo one");
+            shell.type_and_settle(b"echo tw");
+            shell.type_and_settle(b"o");
+            shell.send(b"\r");
+            shell.wait_prompt();
+            shell.command("echo three");
+            leave(shell);
+            let seen = std::fs::read_to_string(&log).unwrap();
+            let seen: Vec<&str> = seen.lines().collect();
+            assert_eq!(
+                seen,
+                ["echo one", "echo two", "echo three", "exit"],
+                "inkling first: {inkling_first}"
+            );
+        }
+    }
+
+    #[test]
+    fn atuin_and_bash_preexec_work_alongside_in_either_order() {
+        if !available() {
+            eprintln!("no atuin or bash-preexec here: skipped");
+            return;
+        }
+        for inkling_first in [true, false] {
+            let sandbox = Sandbox::new();
+            sandbox.atuin_config();
+            let (before, after) = if inkling_first {
+                (String::new(), setup())
+            } else {
+                (setup(), String::new())
+            };
+            warm_up(&sandbox, &before, &after);
+
+            let mut shell = sandbox.shell_around(&before, &after, &[]);
+            shell.type_and_settle(b"echo f");
+            assert_eq!(
+                shell.dim_on_cursor_row(),
+                "irst",
+                "inkling first: {inkling_first}"
+            );
+            shell.send(b"\x15");
+            shell.settle(Duration::from_millis(100));
+            shell.send(b"echo st=$?");
+            shell.settle(Duration::from_millis(100));
+            shell.send(b"\r");
+            assert!(shell.wait_text("st=0"), "{}", shell.screen.text());
+            shell.wait_prompt();
+            leave(shell);
+
+            let commands = recorded(&sandbox);
+            assert!(
+                commands
+                    .iter()
+                    .all(|c| !c.contains("inkling") && !c.contains("READLINE")),
+                "{commands:?}"
+            );
+            assert!(commands.contains(&"echo st=$?".to_owned()), "{commands:?}");
+        }
+    }
+
+    #[test]
+    fn the_atuin_search_is_not_disturbed_and_suggestions_return_after_it() {
+        if !available() {
+            eprintln!("no atuin or bash-preexec here: skipped");
+            return;
+        }
+        let sandbox = Sandbox::new();
+        sandbox.atuin_config();
+        warm_up(&sandbox, "", &setup());
+        let mut shell = sandbox.shell_around("", &setup(), &[]);
+        shell.type_and_settle(b"echo s");
+        assert_eq!(shell.dim_on_cursor_row(), "econd");
+        // Up is Atuin's search, started with what has been typed.
+        let before = shell.raw.len();
+        shell.send(b"\x1b[A");
+        shell.settle(Duration::from_millis(800));
+        shell.send(b"ec");
+        shell.settle(Duration::from_millis(500));
+        let seen = String::from_utf8_lossy(shell.raw.get(before..).unwrap()).into_owned();
+        assert!(!seen.contains("^X"), "a probe reached the search: {seen:?}");
+        assert!(
+            !seen.contains("\x1b[2mecond"),
+            "a suggestion was drawn: {seen:?}"
+        );
+        assert!(
+            shell.screen.text().contains("echo second"),
+            "{}",
+            shell.screen.text()
+        );
+        // Back out of it, to the line as it was.
+        shell.send(b"\x1b");
+        shell.settle(Duration::from_millis(800));
+        shell.send(b"\x15");
+        shell.settle(Duration::from_millis(200));
+        shell.type_and_settle(b"echo f");
+        assert_eq!(shell.dim_on_cursor_row(), "irst", "{}", shell.screen.text());
+        leave(shell);
+    }
+}

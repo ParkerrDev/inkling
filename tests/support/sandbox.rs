@@ -32,11 +32,12 @@ impl Sandbox {
         std::fs::write(self.histfile(), text).unwrap();
     }
 
-    /// The shell setup: a plain prompt, the history file, and inkling.
-    pub fn rc(&self, extra: &str) -> PathBuf {
+    /// The shell setup with `before` ahead of inkling's line and `after`
+    /// behind it.
+    pub fn rc_around(&self, before: &str, after: &str) -> PathBuf {
         let rc = self.home().join("rc.sh");
         let body = format!(
-            "PS1='$ '\nunset PROMPT_COMMAND\nHISTFILE={}\nHISTCONTROL=ignoreboth\n{extra}\neval \"$(inkling init bash)\"\n",
+            "PS1='$ '\nunset PROMPT_COMMAND\nHISTFILE={}\nHISTCONTROL=ignoreboth\n{before}\neval \"$(inkling init bash)\"\n{after}\n",
             self.histfile().display()
         );
         std::fs::write(&rc, body).unwrap();
@@ -79,7 +80,12 @@ impl Sandbox {
     }
 
     pub fn shell_with(&self, extra_rc: &str, env: &[(&str, &str)]) -> Terminal {
-        let rc = self.rc(extra_rc);
+        self.shell_around(extra_rc, "", env)
+    }
+
+    /// As [`Sandbox::shell_with`], with setup before and after inkling's line.
+    pub fn shell_around(&self, before: &str, after: &str, env: &[(&str, &str)]) -> Terminal {
+        let rc = self.rc_around(before, after);
         let argv = Self::bash_argv(&rc);
         let mut vars = self.env();
         vars.extend(env.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())));
@@ -95,6 +101,18 @@ impl Sandbox {
         assert!(prompt, "no prompt:\n{}", terminal.screen.text());
         terminal.settle(std::time::Duration::from_millis(50));
         terminal
+    }
+
+    /// Atuin's settings for a person with no server: nothing leaves the
+    /// machine.
+    pub fn atuin_config(&self) {
+        let dir = self.home().join(".config/atuin");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.toml"),
+            "update_check = false\nauto_sync = false\nsync_address = \"http://127.0.0.1:9\"\nstyle = \"compact\"\n",
+        )
+        .unwrap();
     }
 
     /// An Atuin database as Atuin makes one, with these commands, oldest

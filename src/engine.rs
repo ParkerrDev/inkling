@@ -63,15 +63,28 @@ impl Suggest for crate::index::Index {
     }
 }
 
+/// How the terminal is set, as far as telling who is using it goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// As readline sets it to read a line: no echo, no line editing by the
+    /// terminal, signals and output processing still on.
+    Readline,
+    /// As it is for a program that reads lines: echo and line editing on.
+    /// Where the shell is between one readline and the next.
+    Cooked,
+    /// Anything else, which is a program that has taken it for itself: raw
+    /// mode, with no signals and no output processing.
+    Other,
+}
+
 /// What the engine needs to know about the terminal at the moment, which
 /// only the operating system can say.
 pub trait Tty {
     /// Whether the shell itself, and not a program it started, is in the
     /// foreground of the terminal.
     fn shell_in_front(&self) -> bool;
-    /// Whether the terminal is set the way readline sets it to read a line:
-    /// no echo, no line editing by the terminal.
-    fn readline_mode(&self) -> bool;
+    /// How the terminal is set.
+    fn mode(&self) -> Mode;
 }
 
 /// What happened that the caller may want to act on.

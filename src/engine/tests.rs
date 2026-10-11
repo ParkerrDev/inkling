@@ -9,15 +9,15 @@ const NONCE: &str = "0123456789abcdef";
 
 struct Fake {
     front: Cell<bool>,
-    readline: Cell<bool>,
+    mode: Cell<Mode>,
 }
 
 impl Tty for Fake {
     fn shell_in_front(&self) -> bool {
         self.front.get()
     }
-    fn readline_mode(&self) -> bool {
-        self.readline.get()
+    fn mode(&self) -> Mode {
+        self.mode.get()
     }
 }
 
@@ -86,7 +86,7 @@ impl Sim {
             engine: Engine::new(NONCE, 80, Style::dim(), Words(history.to_vec())),
             tty: Fake {
                 front: Cell::new(true),
-                readline: Cell::new(true),
+                mode: Cell::new(Mode::Readline),
             },
             now: Instant::now(),
             out: Out::default(),
@@ -449,6 +449,24 @@ fn a_program_that_takes_the_terminal_is_waited_out() {
 }
 
 #[test]
+fn a_program_in_raw_mode_under_the_shells_own_group_is_waited_out_too() {
+    // Atuin's search runs in a command substitution, which stays in the
+    // shell's process group: only its terminal settings give it away.
+    let mut sim = Sim::new(&["git status"]);
+    sim.prompt();
+    sim.input(b"\x1b[A");
+    sim.take_shell();
+    sim.tty.mode.set(Mode::Other);
+    sim.output(b"search screen");
+    sim.input(b"abc");
+    assert_eq!(sim.take_shell(), b"abc");
+    sim.tty.mode.set(Mode::Readline);
+    sim.output(b"\r\x1b[KP> found");
+    sim.input(b"g");
+    assert_eq!(sim.take_shell(), probed(b"g"));
+}
+
+#[test]
 fn a_foreground_that_is_not_the_shell_stops_probes_even_without_a_modal_key() {
     let mut sim = Sim::new(&["git status"]);
     sim.prompt();
@@ -461,10 +479,10 @@ fn a_foreground_that_is_not_the_shell_stops_probes_even_without_a_modal_key() {
 fn a_terminal_not_yet_in_readline_mode_gets_no_probe_and_no_quarantine() {
     let mut sim = Sim::new(&["git status"]);
     sim.prompt();
-    sim.tty.readline.set(false);
+    sim.tty.mode.set(Mode::Cooked);
     sim.input(b"g");
     assert_eq!(sim.take_shell(), b"g");
-    sim.tty.readline.set(true);
+    sim.tty.mode.set(Mode::Readline);
     sim.input(b"i");
     assert_eq!(sim.take_shell(), probed(b"i"));
 }
