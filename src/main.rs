@@ -1,0 +1,3 @@
+//! inkling.
+
+fn main() {}

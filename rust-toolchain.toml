@@ -1,0 +1,5 @@
+# The compiler this is built and checked with, and the two tools the checks
+# need. Rule 10: the same analysers for everyone, every time.
+[toolchain]
+channel = "1.99.0"
+components = ["clippy", "rustfmt"]

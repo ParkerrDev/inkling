@@ -1,0 +1,81 @@
+[package]
+name = "inkling"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "Fish-like inline autosuggestions for bash: a transparent pty proxy with an exact probe of readline's own state."
+license = "MIT"
+repository = "https://github.com/ParkerrDev/inkling"
+readme = "README.md"
+keywords = ["bash", "shell", "autosuggestions", "pty", "readline"]
+categories = ["command-line-utilities"]
+
+# One core, thin frontends. The library is everything that knows about the
+# pseudo-terminal, the shell's marks, the keys, the history and the drawing,
+# and it never prints. The program is the faces it has: the proxy, the shell
+# integration text and the doctor.
+[lib]
+name = "inkling"
+path = "src/lib.rs"
+
+[[bin]]
+name = "inkling"
+path = "src/main.rs"
+# Same name as the library: its documentation is the one to build.
+doc = false
+
+[dependencies]
+anyhow = "1.0.104"
+memchr = "2.8.3"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+rustix = { version = "1.1.5", features = ["std", "event", "termios", "pty", "process", "fs", "stdio", "rand", "pipe"] }
+signal-hook = "0.4.5"
+thiserror = "2.0.21"
+unicode-width = "0.2.2"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+# Power of Ten: the lint tables. Run with every warning an error:
+#   cargo clippy --all-targets --all-features -- -D warnings
+[lints.rust]
+# Rule 9: memory safety is never suspended.
+unsafe_code = "forbid"
+# Rule 1: control flow stays analysable; dead code is an error.
+unreachable_code = "deny"
+unreachable_patterns = "deny"
+# Rules 6 and 7: no unused bindings, no discarded results.
+unused = { level = "deny", priority = -1 }
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# Rule 7: never panic on an error; propagate it.
+unwrap_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+expect_used = "warn"
+unreachable = "warn"
+# Rules 2 and 5: nothing that panics at run time on bad data.
+indexing_slicing = "deny"
+arithmetic_side_effects = "warn"
+# Rule 3: never defeat Drop.
+mem_forget = "deny"
+# Rule 9: a reason on every exception.
+undocumented_unsafe_blocks = "warn"
+allow_attributes = "warn"
+allow_attributes_without_reason = "warn"
+# Leftover debugging does not ship, and the core does not print.
+dbg_macro = "warn"
+print_stdout = "warn"
+print_stderr = "warn"
+
+[profile.release]
+opt-level = 2
+lto = true
+codegen-units = 1
+# Rule 1: a panic is a clean stop, not an unwind through every frame.
+panic = "abort"
+strip = true
+# Rule 5: arithmetic never wraps in silence, in a release build either.
+overflow-checks = true

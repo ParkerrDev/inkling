@@ -1,0 +1,48 @@
+# The checks the git hooks run, run again where nobody can skip them: on every
+# push to master and on every pull request. It comes from the kit, which
+# replaces it when the kit is installed again; a repository's own steps go in
+# scripts/ci-setup (what to install first) and scripts/check-repo (what else to
+# check), both optional.
+name: checks
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Text (no em-dashes, no attribution lines)
+        run: scripts/check-text
+
+      - name: What this repository needs installed
+        if: hashFiles('scripts/ci-setup') != ''
+        run: scripts/ci-setup
+
+      - name: The pinned Rust toolchain
+        if: hashFiles('Cargo.toml') != ''
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+        if: hashFiles('Cargo.toml') != ''
+
+      - uses: taiki-e/install-action@v2
+        if: hashFiles('deny.toml') != ''
+        with:
+          tool: cargo-deny
+
+      - name: Rust (format, clippy with no warnings, tests, docs, dependencies)
+        if: hashFiles('Cargo.toml') != ''
+        run: scripts/check-rust
+
+      - name: This repository's own checks
+        if: hashFiles('scripts/check-repo') != ''
+        run: scripts/check-repo
