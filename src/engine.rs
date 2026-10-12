@@ -159,6 +159,9 @@ enum Safety {
         /// when it gives the terminal back, the quarantine ends.
         foreign_seen: bool,
     },
+    /// A signal key has been pressed: the shell will cancel what it runs
+    /// until it has handled it. Only a new prompt ends this.
+    Signalled,
 }
 
 /// The state while at a prompt.
@@ -189,6 +192,13 @@ impl Prompt {
             self.safety = Safety::Quarantined {
                 foreign_seen: false,
             };
+        }
+    }
+
+    /// Ctrl-G ends a quarantine, but not what a signal key began.
+    fn cancel(&mut self) {
+        if matches!(self.safety, Safety::Quarantined { .. }) {
+            self.safety = Safety::Clear;
         }
     }
 

@@ -41,7 +41,9 @@ changes the history it reads.
 `INKLING=0 bash` starts a shell without it, for one session. Set `INKLING=0`
 in the environment to turn it off for everything started from there.
 `INKLING_STYLE` is the SGR parameters the suggestion is drawn with (the
-default is `2`, dim; `38;5;244` is a grey).
+default is `2`, dim; `38;5;244` is a grey). `INKLING_TRACE=/tmp/inkling.log`,
+set before the shell starts, writes every chunk that passes through the proxy,
+in both directions, to that file, for finding out why something went as it did.
 
 ## The keys
 
@@ -135,6 +137,11 @@ exercise:
   motion (Alt-C is fzf's), Up and Down (Atuin's), a lone ESC that never became a
   sequence, or any sequence it does not know. Probes resume at the next prompt,
   when the foreign program has given the terminal back, or at Ctrl-G.
+* Never after a key the terminal turns into a signal: Ctrl-C, Ctrl-Z, Ctrl-\.
+  The shell deals with the signal after it has read the keys that came with it,
+  and a command that runs in that moment is thrown out with the line; found by
+  typing random keys at plain bash and at inkling and comparing. Only a new
+  prompt ends this, not even Ctrl-G.
 * Never inside a bracketed paste, or in the middle of an escape sequence or a
   character. A probe goes after a paste ends, once, whatever its length.
 * One at a time. While a probe is out, the proxy reads nothing more from you

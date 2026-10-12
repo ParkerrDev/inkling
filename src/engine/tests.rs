@@ -387,6 +387,20 @@ fn a_taking_key_straight_after_typing_waits_for_the_line_to_be_known() {
 }
 
 #[test]
+fn keys_before_a_taking_key_in_a_quarantined_prompt_all_go_on() {
+    let mut sim = Sim::new(&["git status"]);
+    sim.prompt();
+    sim.input(b"\x12");
+    sim.take_shell();
+    // No probe will come, so nothing may wait for one.
+    sim.input(b"ab\x1b[C");
+    assert_eq!(sim.take_shell(), b"ab\x1b[C");
+    assert!(!sim.engine.holds_input());
+    sim.input(b"\x02\x05x");
+    assert_eq!(sim.take_shell(), b"\x02\x05x");
+}
+
+#[test]
 fn a_taking_key_that_has_no_suggestion_after_all_goes_on() {
     let mut sim = Sim::new(&["git status"]);
     sim.prompt();
@@ -440,6 +454,40 @@ fn a_modal_key_quarantines_the_prompt_until_a_new_one() {
         sim.take_shell(),
         probed(b"g"),
         "a new prompt is a fresh start"
+    );
+}
+
+#[test]
+fn nothing_is_probed_after_a_signal_key_until_the_next_prompt() {
+    // The shell handles the interrupt after reading the keys that came with
+    // it, and a command that runs then is thrown out with the line.
+    let mut sim = Sim::new(&["git status"]);
+    sim.prompt();
+    sim.input(b"ab\x03cd\x01");
+    assert_eq!(sim.take_shell(), b"ab\x03cd\x01");
+    assert!(!sim.engine.holds_input());
+    sim.input(b"e");
+    assert_eq!(sim.take_shell(), b"e");
+    sim.prompt();
+    sim.input(b"e");
+    assert_eq!(sim.take_shell(), probed(b"e"));
+}
+
+#[test]
+fn ctrl_g_does_not_undo_a_signal_key() {
+    let mut sim = Sim::new(&["git status"]);
+    sim.prompt();
+    sim.input(b"\x03\x07tx");
+    assert_eq!(sim.take_shell(), b"\x03\x07tx");
+    sim.tty.front.set(false);
+    sim.output(b"x");
+    sim.tty.front.set(true);
+    sim.output(b"y");
+    sim.input(b"z");
+    assert_eq!(
+        sim.take_shell(),
+        b"z",
+        "neither Ctrl-G nor a program coming and going helps"
     );
 }
 
@@ -790,6 +838,20 @@ fn a_probe_that_is_answered_with_a_flood_is_given_up_on() {
     assert!(!sim.engine.holds_input());
     sim.input(b"i");
     assert_eq!(sim.take_shell(), b"i", "no more probes at this prompt");
+}
+
+#[test]
+fn keys_held_back_when_a_new_prompt_begins_are_not_lost() {
+    // Ctrl-C ends the line and the shell draws a new prompt; the start of a
+    // key that was waiting for its end is still the shell's.
+    let mut sim = Sim::new(&["git status"]);
+    sim.prompt();
+    sim.input(b"\x03\x1b");
+    assert_eq!(sim.take_shell(), b"\x03");
+    sim.prompt();
+    assert_eq!(sim.take_shell(), b"\x1b");
+    sim.input(b"[D");
+    assert_eq!(sim.take_shell(), probed(b"[D"));
 }
 
 #[test]

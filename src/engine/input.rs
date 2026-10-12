@@ -44,6 +44,9 @@ impl<S: Suggest> Engine<S> {
             return;
         }
         let mode = tty.mode();
+        if prompt.safety == Safety::Signalled {
+            return;
+        }
         if !tty.shell_in_front() || mode == Mode::Other {
             prompt.safety = Safety::Quarantined { foreign_seen: true };
             prompt.line = Line::Unknown;
@@ -159,8 +162,11 @@ impl Prompt {
                 }
                 // The line is not known, but keys before this one are about
                 // to change it: find out first, then see.
+                // That is only worth doing if the probe will be sent: the
+                // same conditions as for sending it after the pass.
                 let unknown = matches!(self.line, Line::Unknown);
-                if unknown && pass.batch.any && pass.batch.last_safe && pass.ready {
+                let probe_follows = pass.ready && !self.quarantined() && !self.in_paste;
+                if unknown && pass.batch.any && pass.batch.last_safe && probe_follows {
                     return Flow::Defer;
                 }
             }
@@ -172,7 +178,8 @@ impl Prompt {
         self.line = Line::Unknown;
         match key {
             Key::Modal => self.quarantine(),
-            Key::Cancel => self.safety = Safety::Clear,
+            Key::Signal => self.safety = Safety::Signalled,
+            Key::Cancel => self.cancel(),
             Key::PasteStart => self.in_paste = true,
             _ => {}
         }

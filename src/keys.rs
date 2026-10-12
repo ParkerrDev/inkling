@@ -50,6 +50,10 @@ pub enum Key {
     Modal,
     /// Ctrl-G: whatever was going on is abandoned.
     Cancel,
+    /// A key the terminal turns into a signal for the shell: interrupt,
+    /// suspend or quit. Not safe to probe after until the shell has drawn a
+    /// new prompt, whatever comes in between.
+    Signal,
     /// The terminal begins a paste.
     PasteStart,
     /// The terminal ends a paste.
@@ -114,6 +118,11 @@ fn control(byte: u8) -> Key {
         // Set mark, quoted insert, searches, Ctrl-T (taken by fzf), Ctrl-V,
         // the prefix Ctrl-X, and character search.
         0x00 | 0x11 | 0x12 | 0x13 | 0x14 | 0x16 | 0x18 | 0x1d => Key::Modal,
+        // The keys the terminal turns into a signal (interrupt, suspend,
+        // quit). The shell handles one after the keys that followed it have
+        // been read, and a command that runs in that moment is cancelled with
+        // the line, so nothing is probed until the shell is at a new prompt.
+        0x03 | 0x1a | 0x1c => Key::Signal,
         _ => Key::Neutral,
     }
 }
@@ -387,7 +396,7 @@ mod tests {
 
     #[test]
     fn the_keys_with_a_run_of_their_own_are_not_safe() {
-        for byte in [0x09u8, 0x0b, 0x0c, 0x0e, 0x10, 0x15, 0x17, 0x19, 0x04, 0x03] {
+        for byte in [0x09u8, 0x0b, 0x0c, 0x0e, 0x10, 0x15, 0x17, 0x19, 0x04] {
             is(&[byte], Key::Neutral);
             assert!(!Key::Neutral.probe_safe());
         }
@@ -400,6 +409,10 @@ mod tests {
     fn the_keys_that_may_leave_the_plain_state_are_modal() {
         for byte in [0x00u8, 0x11, 0x12, 0x13, 0x14, 0x16, 0x18, 0x1d] {
             is(&[byte], Key::Modal);
+        }
+        // And the ones that become a signal.
+        for byte in [0x03u8, 0x1a, 0x1c] {
+            is(&[byte], Key::Signal);
         }
         is(b"\x1b[A", Key::Modal);
         is(b"\x1b[B", Key::Modal);

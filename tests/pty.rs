@@ -731,6 +731,220 @@ mod tests {
         );
     }
 
+    /// What a random session of editing is made of: letters, and the keys
+    /// that move, delete, recall and complete. Some are there twice, to come
+    /// up more often.
+    const EDITING: [&[u8]; 39] = [
+        b"a",
+        b"b",
+        b"c",
+        b"e",
+        b"g",
+        b"i",
+        b"s",
+        b"t",
+        b" ",
+        b" ",
+        b"-",
+        b"x",
+        b"\x7f",
+        b"\x7f",
+        b"\x1b[D",
+        b"\x1b[D",
+        b"\x1b[3~",
+        b"\x01",
+        b"\x1bb",
+        b"\x17",
+        b"\x0b",
+        b"\x19",
+        b"\x15",
+        b"\x14",
+        b"\x0c",
+        b"\x1b[H",
+        b"\x02",
+        b"\x04",
+        b"\t",
+        b"\x1bd",
+        b"\x1b.",
+        b"\x1bc",
+        b"\x1bu",
+        b"\x1b\x7f",
+        b"\x12",
+        b"\x07",
+        b"\x18\x15",
+        b"\x1b[A",
+        b"\x1b[B",
+    ];
+
+    /// Ctrl-C, for the sessions that are interrupted now and then.
+    const INTERRUPTS: [&[u8]; 2] = [b"\x03", b"\x03"];
+
+    /// The keys that take a suggestion, or part of one.
+    const TAKING: [&[u8]; 6] = [
+        b"\x1b[C",
+        b"\x1b[F",
+        b"\x05",
+        b"\x1bf",
+        b"\x06",
+        b"\x1b[1;5C",
+    ];
+
+    /// The keys of a random session of editing: no accepting keys unless
+    /// `accepting`, since those are meant to differ.
+    fn random_editing(seed: u64, keys: usize, accepting: bool, signals: bool) -> Vec<Vec<u8>> {
+        let mut state = seed;
+        let mut next = move |bound: usize| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            usize::try_from(state.checked_shr(33).unwrap_or(0))
+                .unwrap()
+                .checked_rem(bound)
+                .unwrap_or(0)
+        };
+        let mut alphabet: Vec<&[u8]> = EDITING.to_vec();
+        if signals {
+            alphabet.extend(INTERRUPTS);
+        }
+        if accepting {
+            alphabet.extend(TAKING);
+        }
+        (0..keys)
+            .map(|_| {
+                alphabet
+                    .get(next(alphabet.len()))
+                    .copied()
+                    .unwrap_or(b"a")
+                    .to_vec()
+            })
+            .collect()
+    }
+
+    /// The state of what was typed: the row without any suggestion on it, and
+    /// where the cursor is.
+    fn typed_state(terminal: &Terminal) -> String {
+        let (x, y) = terminal.screen.cursor();
+        format!("{}|{x}", terminal.screen.solid_row(y))
+    }
+
+    /// How the keys are cut into writes.
+    #[derive(Clone, Copy)]
+    enum Cut {
+        /// Whole keys, a few at a time, as a person's terminal writes them.
+        AtKeys,
+        /// Anywhere at all, in the middle of escape sequences too.
+        Anywhere,
+    }
+
+    /// Cut `keys` into writes, by a seeded random choice.
+    fn writes(keys: &[Vec<u8>], seed: u64, cut: Cut) -> Vec<Vec<u8>> {
+        let mut state = seed;
+        let mut next = move |bound: usize| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            usize::try_from(state.checked_shr(40).unwrap_or(0))
+                .unwrap()
+                .checked_rem(bound)
+                .unwrap_or(0)
+        };
+        let mut out = Vec::new();
+        match cut {
+            Cut::AtKeys => {
+                let mut rest = keys;
+                while !rest.is_empty() {
+                    let mut take = next(4).saturating_add(1).min(rest.len());
+                    // What the shell does with keys that come in the very
+                    // write that has Ctrl-C in it is a race even in plain
+                    // bash, and a person cannot type that fast: the write
+                    // ends with the signal key.
+                    if let Some(at) = rest
+                        .iter()
+                        .take(take)
+                        .position(|key| key.as_slice() == b"\x03")
+                    {
+                        take = at.saturating_add(1);
+                    }
+                    let (now, later) = rest.split_at(take);
+                    out.push(now.iter().flatten().copied().collect());
+                    rest = later;
+                }
+            }
+            Cut::Anywhere => {
+                let bytes: Vec<u8> = keys.iter().flatten().copied().collect();
+                let mut at = 0;
+                while at < bytes.len() {
+                    let end = at
+                        .saturating_add(next(9).saturating_add(1))
+                        .min(bytes.len());
+                    out.push(bytes.get(at..end).unwrap().to_vec());
+                    at = end;
+                }
+            }
+        }
+        out
+    }
+
+    /// Both shells get the same keys in the same writes and after each write
+    /// they must show the same. `with_history` gives both something to
+    /// suggest from, and then the keys that take a suggestion are left out,
+    /// since those are meant to differ; without history they are tried.
+    fn stays_in_step(with_history: bool, signals: bool, cut: Cut) {
+        let history = [
+            "eab c",
+            "git status",
+            "abc abc",
+            "test it",
+            "ls -la",
+            "xxit",
+        ];
+        // More seeds, for a longer search, with FUZZ_SEEDS=100.
+        let seeds: u64 = std::env::var("FUZZ_SEEDS")
+            .ok()
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(5);
+        for seed in 1..=seeds {
+            let keys = random_editing(seed, 60, !with_history, signals);
+            let plain_home = Sandbox::new();
+            let inkling_home = Sandbox::new();
+            if with_history {
+                plain_home.write_history(&history);
+                inkling_home.write_history(&history);
+            }
+            let mut plain = plain_home.shell_with("", &[("INKLING", "0")]);
+            let mut wrapped = inkling_home.shell("");
+            let mut so_far = Vec::new();
+            for chunk in writes(&keys, seed, cut) {
+                plain.send(&chunk);
+                wrapped.send(&chunk);
+                so_far.extend_from_slice(&chunk);
+                plain.settle(Duration::from_millis(40));
+                wrapped.settle(Duration::from_millis(40));
+                assert_eq!(
+                    typed_state(&wrapped),
+                    typed_state(&plain),
+                    "seed {seed}, after {so_far:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn random_editing_with_suggestions_showing_stays_in_step_with_plain_bash() {
+        stays_in_step(true, true, Cut::AtKeys);
+    }
+
+    #[test]
+    fn random_editing_with_the_taking_keys_and_no_history_stays_in_step() {
+        stays_in_step(false, true, Cut::AtKeys);
+    }
+
+    #[test]
+    fn keys_cut_in_the_middle_of_sequences_stay_in_step_too() {
+        stays_in_step(true, false, Cut::Anywhere);
+        stays_in_step(false, false, Cut::Anywhere);
+    }
+
     #[test]
     fn the_integration_text_the_program_prints_is_the_one_in_the_library() {
         let output = std::process::Command::new(env!("CARGO_BIN_EXE_inkling"))

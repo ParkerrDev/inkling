@@ -60,6 +60,9 @@ pub struct Settings {
     pub environ: Option<String>,
     pub style: Style,
     pub env: history::Env,
+    /// A file to write what passes to, one line a chunk: for finding out why
+    /// something went as it did.
+    pub trace: Option<PathBuf>,
 }
 
 /// Run `settings.command` in a pseudo-terminal until it exits, with
@@ -87,7 +90,14 @@ pub fn run(settings: &Settings) -> Result<i32> {
     let columns = usize::from(size.ws_col);
     let engine = Engine::new(&nonce, columns, settings.style.clone(), brain);
     let _raw = RawMode::enter(&settings_of_terminal)?;
-    Proxy::new(master, child, engine, signals).run()
+    let trace = settings.trace.as_deref().and_then(|path| {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .ok()
+    });
+    Proxy::new(master, child, engine, signals, trace).run()
 }
 
 /// The real terminal's settings and size.
@@ -307,10 +317,18 @@ struct Proxy {
     input: Vec<u8>,
     output: Vec<u8>,
     cwd: PathBuf,
+    trace: Option<std::fs::File>,
+    started: Instant,
 }
 
 impl Proxy {
-    fn new(master: OwnedFd, child: Child, engine: Engine<Brain>, signals: Signals) -> Self {
+    fn new(
+        master: OwnedFd,
+        child: Child,
+        engine: Engine<Brain>,
+        signals: Signals,
+        trace: Option<std::fs::File>,
+    ) -> Self {
         let shell = Pid::from_child(&child);
         Self {
             master,
@@ -323,6 +341,8 @@ impl Proxy {
             to_shell: Vec::new(),
             input: vec![0; CHUNK],
             output: vec![0; CHUNK],
+            trace,
+            started: Instant::now(),
         }
     }
 
@@ -439,6 +459,7 @@ impl Proxy {
             shell: self.shell,
         };
         let bytes = self.output.get(..count).unwrap_or_default();
+        trace(&mut self.trace, self.started, "from the shell", bytes);
         self.engine.on_output(now, bytes, &facts, &mut self.out);
         self.apply()?;
         Ok(true)
@@ -457,6 +478,7 @@ impl Proxy {
             shell: self.shell,
         };
         let bytes = self.input.get(..count).unwrap_or_default();
+        trace(&mut self.trace, self.started, "from the person", bytes);
         self.engine.on_input(now, bytes, &facts, &mut self.out);
         self.apply()?;
         Ok(true)
@@ -503,6 +525,18 @@ impl Proxy {
 
     /// Carry out what the engine decided.
     fn apply(&mut self) -> Result<()> {
+        trace(
+            &mut self.trace,
+            self.started,
+            "to the terminal",
+            &self.out.to_terminal,
+        );
+        trace(
+            &mut self.trace,
+            self.started,
+            "to the shell",
+            &self.out.to_shell,
+        );
         write_all(stdout(), &self.out.to_terminal)?;
         self.to_shell.extend_from_slice(&self.out.to_shell);
         let events = std::mem::take(&mut self.out.events);
@@ -601,6 +635,22 @@ fn reap(child: &mut Child) -> i32 {
     let _killed = child.kill();
     let _reaped = child.wait();
     1
+}
+
+/// Note in the trace file, if there is one, that `bytes` passed.
+fn trace(file: &mut Option<std::fs::File>, started: Instant, what: &str, bytes: &[u8]) {
+    use std::io::Write;
+    if let Some(file) = file
+        && !bytes.is_empty()
+    {
+        // A trace that cannot be written is not worth stopping for.
+        let _ = writeln!(
+            file,
+            "{:9.3} ms {what}: {:?}",
+            started.elapsed().as_secs_f64() * 1e3,
+            String::from_utf8_lossy(bytes)
+        );
+    }
 }
 
 /// Write all of `bytes`, waiting for the descriptor when it is full.

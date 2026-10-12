@@ -108,6 +108,7 @@ fn run_command(rest: &[&OsStr]) -> Result<i32> {
         command,
         arg0,
         environ: std::env::var("INKLING_ENVIRON").ok(),
+        trace: std::env::var_os("INKLING_TRACE").map(Into::into),
         style,
         env: history::Env::from_process(),
     };

@@ -127,6 +127,11 @@ impl<S: Suggest> Engine<S> {
             Mark::Prompt { flags } => {
                 self.release_held(out);
                 self.column.forget();
+                if let Phase::Prompt(old) = &mut self.phase {
+                    // Keys kept back at the old prompt were meant for the
+                    // shell, which is now at a new one (after Ctrl-C, say).
+                    out.to_shell.append(&mut old.input);
+                }
                 self.phase = Phase::Prompt(Box::new(Prompt::new(&flags)));
                 self.submitted = None;
                 out.events.push(Event::PromptStarted);

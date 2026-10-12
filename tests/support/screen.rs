@@ -162,6 +162,21 @@ impl Screen {
         text.trim_end().to_owned()
     }
 
+    /// The text of a row that is not dim: the row without a suggestion on it.
+    pub fn solid_row(&self, y: usize) -> String {
+        let text: String = self
+            .grid_ref()
+            .get(y)
+            .map(|row| {
+                row.iter()
+                    .filter(|c| !c.dim && !c.tail)
+                    .map(|c| c.ch)
+                    .collect()
+            })
+            .unwrap_or_default();
+        text.trim_end().to_owned()
+    }
+
     /// The text of the dim cells of a row, in order.
     pub fn dim_text(&self, y: usize) -> String {
         self.grid_ref()
