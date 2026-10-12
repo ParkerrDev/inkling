@@ -27,6 +27,23 @@ mod tests {
     }
 
     #[test]
+    fn with_no_terminal_to_wrap_the_command_still_runs_and_is_told_inkling_is_off() {
+        // A shell must come up whatever becomes of the suggestions. Here the
+        // proxy cannot be set up at all (there is no terminal), which stands
+        // for every reason it might not be.
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_inkling"))
+            .args(["run", "--", "sh", "-c", "echo ran-with-$INKLING"])
+            .env_remove("INKLING")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "ran-with-0\n");
+        let said = String::from_utf8_lossy(&output.stderr);
+        assert!(said.contains("running without suggestions"), "{said}");
+    }
+
+    #[test]
     fn a_suggestion_appears_dim_after_a_prefix() {
         let (_sandbox, mut shell) = shell_with_history();
         shell.type_and_settle(b"git");
@@ -1048,14 +1065,14 @@ mod tests {
     }
 
     #[test]
-    fn it_does_not_start_where_there_is_no_terminal() {
+    fn where_there_is_no_terminal_it_says_so_and_runs_the_command_plainly() {
         let sandbox = Sandbox::new();
         let output = std::process::Command::new(env!("CARGO_BIN_EXE_inkling"))
-            .args(["run", "--", "true"])
+            .args(["run", "--", "sh", "-c", "exit 7"])
             .env("HOME", sandbox.home())
             .output()
             .unwrap();
-        assert!(!output.status.success());
+        assert_eq!(output.status.code(), Some(7), "the command's own status");
         assert!(String::from_utf8_lossy(&output.stderr).contains("not a terminal"));
     }
 

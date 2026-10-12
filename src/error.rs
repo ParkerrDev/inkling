@@ -36,6 +36,10 @@ pub enum Error {
     /// The terminal is not a terminal.
     #[error("{0} is not a terminal")]
     NotATerminal(&'static str),
+    /// The proxy could not be set up, so nothing was run in it. Whoever
+    /// asked can still run the command without it.
+    #[error("{0}")]
+    NotStarted(#[source] Box<Error>),
 }
 
 impl Error {

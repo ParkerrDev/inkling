@@ -112,7 +112,31 @@ fn run_command(rest: &[&OsStr]) -> Result<i32> {
         style,
         env: history::Env::from_process(),
     };
-    proxy::run(&settings).context("run in the proxy")
+    match proxy::run(&settings) {
+        // A terminal has to come up with a shell in it whatever becomes of
+        // the suggestions: one that closes as it opens cannot even be used
+        // to find out why. The command is run as if inkling were turned
+        // off, and told so, so that its startup file does not try again.
+        Err(inkling::Error::NotStarted(why)) => {
+            out::note(format_args!("inkling: {why}; running without suggestions"))?;
+            replace_plain(settings.arg0.as_deref(), &settings.command)
+        }
+        other => other.context("run in the proxy"),
+    }
+}
+
+/// Become the program with inkling turned off for it.
+fn replace_plain(name: Option<&OsStr>, command: &[OsString]) -> Result<i32> {
+    let Some((program, tail)) = command.split_first() else {
+        bail!("no command to run");
+    };
+    let mut process = std::process::Command::new(program);
+    process.args(tail).env("INKLING", "0");
+    if let Some(name) = name {
+        process.arg0(name);
+    }
+    let failure = process.exec();
+    Err(anyhow::Error::from(failure).context(format!("start {}", program.display())))
 }
 
 /// The hidden command: become the session leader and then the program.

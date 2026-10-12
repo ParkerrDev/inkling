@@ -73,6 +73,17 @@ pub struct Settings {
 /// When the terminal is not one, or the system will not make the
 /// pseudo-terminal or start the program.
 pub fn run(settings: &Settings) -> Result<i32> {
+    // What fails in here fails before the session has begun, and is told
+    // apart from what fails during one: the command can then still be run
+    // plainly, which for a terminal's shell is the difference between a
+    // shell without suggestions and a window that closes as it opens.
+    let (proxy, _raw) = prepare(settings).map_err(|error| Error::NotStarted(Box::new(error)))?;
+    proxy.run()
+}
+
+/// The proxy with its shell started in it, and the real terminal in raw
+/// mode for as long as the second of the pair is kept.
+fn prepare(settings: &Settings) -> Result<(Proxy, RawMode)> {
     let (settings_of_terminal, size) = capture_terminal()?;
     let pty = pty::open(size, &settings_of_terminal)?;
     let nonce = nonce()?;
@@ -89,7 +100,7 @@ pub fn run(settings: &Settings) -> Result<i32> {
     let brain = Brain::load(&settings.env);
     let columns = usize::from(size.ws_col);
     let engine = Engine::new(&nonce, columns, settings.style.clone(), brain);
-    let _raw = RawMode::enter(&settings_of_terminal)?;
+    let raw = RawMode::enter(&settings_of_terminal)?;
     let trace = settings.trace.as_deref().and_then(|path| {
         std::fs::OpenOptions::new()
             .create(true)
@@ -97,7 +108,7 @@ pub fn run(settings: &Settings) -> Result<i32> {
             .open(path)
             .ok()
     });
-    Proxy::new(master, child, engine, signals, trace).run()
+    Ok((Proxy::new(master, child, engine, signals, trace), raw))
 }
 
 /// The real terminal's settings and size.

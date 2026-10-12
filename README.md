@@ -38,6 +38,10 @@ To remove it, `./uninstall.sh`: it takes the block out of `~/.bashrc`, leaving
 the rest as it was, and removes the program. It keeps no data, and never
 changes the history it reads.
 
+If inkling cannot set itself up (no pseudo-terminal to be had, say), it says
+why in one line and starts your shell without suggestions: a terminal always
+comes up with a shell in it.
+
 `INKLING=0 bash` starts a shell without it, for one session. Set `INKLING=0`
 in the environment to turn it off for everything started from there.
 `INKLING_STYLE` is the SGR parameters the suggestion is drawn with (the
