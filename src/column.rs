@@ -18,6 +18,10 @@ use crate::text::width;
 /// Tab stops are every eight columns.
 const TAB: usize = 8;
 
+/// The most output without a carriage return that is followed while no
+/// prompt is up; past it the column is let go until the next one.
+const FOLLOW_LIMIT: usize = 4096;
+
 /// The most numeric parameters of a control sequence that are kept.
 const PARAMS: usize = 4;
 
@@ -140,6 +144,22 @@ impl Column {
     #[must_use]
     pub fn position(&self) -> Option<usize> {
         self.known.then_some(self.at)
+    }
+
+    /// Follow output written while no prompt is up, cheaply: only what comes
+    /// after its last carriage return can still matter when the next prompt
+    /// comes, so only that is read, from column 0.
+    pub fn follow(&mut self, bytes: &[u8]) {
+        match memchr::memrchr(b'\r', bytes) {
+            Some(at) => {
+                self.parse = Parse::Ground;
+                self.utf8_need = 0;
+                self.carriage_return();
+                self.feed(bytes.get(at.saturating_add(1)..).unwrap_or_default());
+            }
+            None if self.known && bytes.len() <= FOLLOW_LIMIT => self.feed(bytes),
+            None => self.forget(),
+        }
     }
 
     /// Follow `bytes` that were written to the terminal.
@@ -448,5 +468,23 @@ mod tests {
     fn a_string_sequence_hides_its_text() {
         let model = after(80, "\x1b]8;;http://example.com\x1b\\link\x1b]8;;\x1b\\");
         assert_eq!(model.position(), Some(4));
+    }
+
+    #[test]
+    fn output_while_no_prompt_is_up_is_followed_from_its_last_carriage_return() {
+        let mut column = Column::new(80);
+        column.follow(b"a long line of output\r\nand the rest");
+        assert_eq!(column.position(), Some(12));
+        column.follow(b" and more");
+        assert_eq!(column.position(), Some(21));
+        // Too much without a carriage return to be worth following.
+        column.follow(&[b'x'; 5000]);
+        assert_eq!(column.position(), None);
+        column.follow(b"\r\n$ ");
+        assert_eq!(column.position(), Some(2));
+        // A carriage return inside a sequence that is cut short leaves the
+        // sequence behind: what follows it is read from column 0.
+        column.follow(b"\x1b[3\r\nok");
+        assert_eq!(column.position(), Some(2));
     }
 }

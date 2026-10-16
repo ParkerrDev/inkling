@@ -1,7 +1,7 @@
 //! The person's side: keys on their way to the shell.
 
 use super::{
-    Batch, Ctx, Engine, Flow, Instant, Line, Mode, Out, PASTE_END, PROBE_KEYS, Phase, Probe,
+    Ahead, Batch, Ctx, Engine, Flow, Instant, Line, Mode, Out, PASTE_END, PROBE_KEYS, Phase, Probe,
     Prompt, Safety, Suggest, Tty,
 };
 use crate::keys::{self, Accept, Key, Token};
@@ -20,6 +20,9 @@ impl<S: Suggest> Engine<S> {
     /// The person typed `bytes`.
     pub fn on_input(&mut self, now: Instant, bytes: &[u8], tty: &dyn Tty, out: &mut Out) {
         let Phase::Prompt(prompt) = &mut self.phase else {
+            // Typed while a command runs: what readline finds at the next
+            // prompt.
+            self.typeahead |= !bytes.is_empty();
             out.to_shell.extend_from_slice(bytes);
             return;
         };
@@ -67,6 +70,7 @@ impl<S: Suggest> Engine<S> {
             phase,
             shown,
             submitted,
+            typeahead,
             ..
         } = self;
         let Phase::Prompt(prompt) = phase else {
@@ -90,6 +94,7 @@ impl<S: Suggest> Engine<S> {
                 Line::Known { text, .. } => Some(text.clone()),
                 Line::Unknown => None,
             };
+            *typeahead = prompt.prefills || !prompt.input.is_empty();
             out.to_shell.append(&mut prompt.input);
             self.phase = Phase::Away;
             return;
@@ -100,12 +105,17 @@ impl<S: Suggest> Engine<S> {
             && !prompt.quarantined()
             && !prompt.in_paste
             && !prompt.disabled;
+        let ahead = prompt.ahead.take();
         if due {
             out.to_shell.extend_from_slice(PROBE_KEYS);
             prompt.probe = Probe::Waiting { since: now };
         }
         if prompt.input.is_empty() {
             prompt.input_since = None;
+        }
+        // Only with a probe out: its redraw is what corrects a wrong guess.
+        if due && let Some(ahead) = ahead {
+            self.draw_ahead(&ahead, out);
         }
     }
 }
@@ -116,6 +126,7 @@ impl Prompt {
     /// probe, or reaches one that runs the line.
     fn pass(&mut self, pass: &mut Pass<'_>) -> Flow {
         let input = std::mem::take(&mut self.input);
+        self.ahead = Ahead::from(&self.line);
         let mut at = 0;
         let mut flow = Flow::Next;
         // Every turn takes at least one byte, or ends the pass.
@@ -152,6 +163,7 @@ impl Prompt {
         match key {
             Key::Submit => {
                 pass.out.to_shell.extend_from_slice(raw);
+                self.prefills = raw == b"\x0f";
                 return Flow::Leave;
             }
             Key::Accept(kind) => {
@@ -175,6 +187,7 @@ impl Prompt {
         pass.out.to_shell.extend_from_slice(raw);
         pass.batch.any = true;
         pass.batch.last_safe = key.probe_safe();
+        self.ahead = self.ahead.take().and_then(|ahead| ahead.after(key, raw));
         self.line = Line::Unknown;
         match key {
             Key::Modal => self.quarantine(),
@@ -205,6 +218,7 @@ impl Prompt {
             return false;
         }
         pass.out.to_shell.extend_from_slice(part.as_bytes());
+        self.ahead = self.ahead.take().and_then(|ahead| ahead.typed(part));
         self.line = Line::Unknown;
         true
     }

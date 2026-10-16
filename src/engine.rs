@@ -21,6 +21,14 @@
 //!   terminal and, if the cursor is at the end of a line that starts a command
 //!   in the history, the rest of that command is drawn dim after the cursor.
 //! * Before the next output reaches the terminal, the suggestion is erased.
+//! * Where the line is known for certain, the cursor is at its end, and the
+//!   keys only type plain characters, delete the last ones or take part of
+//!   the suggestion, what they will do is drawn at once, with the suggestion
+//!   for the line they make, without waiting for the shell. The probe goes
+//!   out as always; before the shell's own redraw is let through, the cursor
+//!   is put back where the shell has it and what was drawn ahead is cleared,
+//!   so the shell's drawing lands where it expects and corrects anything that
+//!   was guessed wrong.
 //! * A key that takes the suggestion is not sent; the missing characters are,
 //!   as if typed.
 //! * A probe is never sent when it might reach anything but readline: after
@@ -131,6 +139,80 @@ enum Line {
     Known { text: String, at_end: bool },
 }
 
+/// What the keys of one pass will make of a line known for certain, with
+/// the cursor at its end: the line they make, the characters they add at the
+/// end and how many they delete from it first. Only plain characters, a
+/// column each, are ever drawn ahead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Ahead {
+    line: String,
+    typed: String,
+    deleted: usize,
+}
+
+/// Whether `text` is what may be drawn ahead: printable ASCII.
+fn plain(text: &str) -> bool {
+    text.bytes().all(|b| (0x20..=0x7e).contains(&b))
+}
+
+impl Ahead {
+    fn from(line: &Line) -> Option<Self> {
+        match line {
+            Line::Known { text, at_end: true } => Some(Self {
+                line: text.clone(),
+                typed: String::new(),
+                deleted: 0,
+            }),
+            _ => None,
+        }
+    }
+
+    /// After `text` is typed at the end.
+    fn typed(mut self, text: &str) -> Option<Self> {
+        if !plain(text) {
+            return None;
+        }
+        self.line.push_str(text);
+        self.typed.push_str(text);
+        Some(self)
+    }
+
+    /// After one character at the end is deleted.
+    fn backspace(mut self) -> Option<Self> {
+        if self.typed.pop().is_some() {
+            self.line.pop();
+            return Some(self);
+        }
+        match self.line.chars().next_back() {
+            // Nothing to delete: readline rings the bell, and the line stays.
+            None => Some(self),
+            Some(last) if plain(last.encode_utf8(&mut [0; 4])) => {
+                self.line.pop();
+                self.deleted = self.deleted.checked_add(1)?;
+                Some(self)
+            }
+            Some(_) => None,
+        }
+    }
+
+    /// After `key`, whose bytes were `raw`, went to the shell.
+    fn after(self, key: crate::keys::Key, raw: &[u8]) -> Option<Self> {
+        use crate::keys::Key;
+        match (key, raw) {
+            (Key::Text, [byte]) => self.typed(std::str::from_utf8(&[*byte]).ok()?),
+            (Key::Edit, [0x7f | 0x08]) => self.backspace(),
+            // At the end of the line, with nothing taken, these keys leave
+            // the cursor where it is.
+            (Key::Accept(_), _) => Some(self),
+            _ => None,
+        }
+    }
+
+    fn nothing(&self) -> bool {
+        self.typed.is_empty() && self.deleted == 0
+    }
+}
+
 /// Where a probe is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Probe {
@@ -180,6 +262,12 @@ struct Prompt {
     input_since: Option<Instant>,
     /// The last bytes of a paste, to find its end across reads.
     paste_tail: Vec<u8>,
+    /// What the keys of the pass under way make of the line, while that can
+    /// be told for certain.
+    ahead: Option<Ahead>,
+    /// The key that ran the line puts a line of the history into the next
+    /// prompt (Ctrl-O).
+    prefills: bool,
 }
 
 impl Prompt {
@@ -202,16 +290,26 @@ impl Prompt {
         }
     }
 
-    fn new(flags: &[u8]) -> Self {
+    /// A prompt, whose line starts empty when nothing was typed ahead for it.
+    fn new(flags: &[u8], empty: bool) -> Self {
         Self {
             disabled: flags.contains(&b'v'),
             safety: Safety::Clear,
             in_paste: false,
-            line: Line::Unknown,
+            line: if empty {
+                Line::Known {
+                    text: String::new(),
+                    at_end: true,
+                }
+            } else {
+                Line::Unknown
+            },
             probe: Probe::Idle,
             input: Vec::new(),
             input_since: None,
             paste_tail: Vec::new(),
+            ahead: None,
+            prefills: false,
         }
     }
 }
@@ -269,6 +367,12 @@ pub struct Engine<S> {
     pump_due: bool,
     /// The line, if it was known for certain, when the keys that ran it passed.
     submitted: Option<String>,
+    /// How many columns the cursor on the terminal is ahead of where the
+    /// shell has it, after keys were drawn ahead (behind, if negative).
+    ahead: i64,
+    /// Keys went to the shell for its next prompt: typed while a command ran,
+    /// or after the key that ran the line.
+    typeahead: bool,
 }
 
 impl<S: Suggest> Engine<S> {
@@ -289,6 +393,8 @@ impl<S: Suggest> Engine<S> {
             mark_since: None,
             pump_due: false,
             submitted: None,
+            ahead: 0,
+            typeahead: false,
         }
     }
 
@@ -355,8 +461,67 @@ impl<S: Suggest> Engine<S> {
     }
 
     fn erase(&mut self, out: &mut Out) {
+        if self.ahead != 0 {
+            // Back to where the shell has the cursor, and everything drawn
+            // ahead of it cleared: the suggestion is on the same row, after.
+            render::step(self.ahead.saturating_neg(), &mut out.to_terminal);
+            self.ahead = 0;
+            out.to_terminal.extend_from_slice(render::ERASE);
+            self.shown = None;
+        }
         if self.shown.take().is_some() {
             out.to_terminal.extend_from_slice(render::ERASE);
+        }
+    }
+
+    /// The suggestion for `text` with `room` columns to draw it in: the whole
+    /// rest of the command, and as much of it as fits.
+    fn suggestion_for(&self, text: &str, room: usize) -> Option<(String, String)> {
+        // Never for an empty line, and not for one that is more than a row
+        // of plain text.
+        if text.is_empty() || text.chars().any(char::is_control) {
+            return None;
+        }
+        let command = self.suggester.suggest(text)?;
+        let rest = command.strip_prefix(text)?;
+        let visible = text::fit(rest, room)?;
+        Some((rest.to_owned(), visible))
+    }
+
+    /// Draw what the keys just passed will do, and the suggestion for the
+    /// line they make, without waiting for the shell. Only on the cursor's
+    /// own row: whatever would reach another row waits for the shell.
+    fn draw_ahead(&mut self, ahead: &Ahead, out: &mut Out) {
+        debug_assert_eq!(self.ahead, 0, "nothing is ahead while no probe is out");
+        if ahead.nothing() || self.ahead != 0 {
+            return;
+        }
+        let (Some(room), Some(at)) = (self.column.room(), self.column.position()) else {
+            return;
+        };
+        // A column a character: only printable ASCII is drawn ahead.
+        let width = ahead.typed.len();
+        if width >= room || ahead.deleted > at {
+            return;
+        }
+        let (Ok(forward), Ok(back)) = (i64::try_from(width), i64::try_from(ahead.deleted)) else {
+            return;
+        };
+        let Some(moved) = forward.checked_sub(back) else {
+            return;
+        };
+        if self.shown.take().is_some() || ahead.deleted > 0 {
+            render::step(back.saturating_neg(), &mut out.to_terminal);
+            out.to_terminal.extend_from_slice(render::ERASE);
+        }
+        if !ahead.typed.is_empty() {
+            render::typed(&ahead.typed, &mut out.to_terminal);
+        }
+        self.ahead = moved;
+        let free = room.saturating_sub(width).saturating_add(ahead.deleted);
+        if let Some((whole, visible)) = self.suggestion_for(&ahead.line, free) {
+            render::draw(&visible, &self.style, &mut out.to_terminal);
+            self.shown = Some(whole);
         }
     }
 

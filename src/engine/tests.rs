@@ -63,6 +63,11 @@ fn drawn(rest: &str) -> Vec<u8> {
     format!("\x1b7\x1b[?7l\x1b[2m{rest}\x1b[22m\x1b[?7h\x1b8").into_bytes()
 }
 
+/// The bytes that write `text` typed ahead of the shell.
+fn typed(text: &str) -> Vec<u8> {
+    format!("\x1b[?7l{text}\x1b[?7h").into_bytes()
+}
+
 /// `keys` followed by the probe.
 fn probed(keys: &[u8]) -> Vec<u8> {
     let mut bytes = keys.to_vec();
@@ -141,6 +146,13 @@ impl Sim {
         self.take_terminal();
     }
 
+    /// The shell draws a prompt after keys were typed ahead for it, so its
+    /// line is not known until a probe says what it is.
+    fn prompt_unknown(&mut self) {
+        self.engine.typeahead = true;
+        self.prompt();
+    }
+
     /// The person types `typed`; the shell answers with the probe's reply for
     /// `line`; the redraw settles. Returns what the terminal was sent.
     fn type_and_settle(&mut self, typed: &[u8], line: &str) -> Vec<u8> {
@@ -179,7 +191,7 @@ fn a_key_at_a_prompt_goes_on_with_a_probe_and_input_is_held() {
 #[test]
 fn the_suggestion_is_drawn_after_the_redraw_in_one_go() {
     let mut sim = Sim::new(&["git status"]);
-    sim.prompt();
+    sim.prompt_unknown();
     let sent = sim.type_and_settle(b"g", "g");
     let mut expect = b"\r\x1b[K\rP> g".to_vec();
     expect.extend(drawn("it status"));
@@ -190,7 +202,7 @@ fn the_suggestion_is_drawn_after_the_redraw_in_one_go() {
 #[test]
 fn the_suggestion_comes_as_soon_as_the_redraw_ends_with_the_line() {
     let mut sim = Sim::new(&["git status"]);
-    sim.prompt();
+    sim.prompt_unknown();
     sim.input(b"g");
     sim.output(b"g");
     sim.output(&reply("g", 1));
@@ -231,7 +243,7 @@ fn more_output_after_the_report_extends_the_wait() {
 #[test]
 fn a_probe_that_is_not_answered_is_given_up_on_and_the_prompt_is_quarantined() {
     let mut sim = Sim::new(&["git status"]);
-    sim.prompt();
+    sim.prompt_unknown();
     sim.input(b"g");
     sim.output(b"g");
     sim.wait(100);
@@ -258,12 +270,24 @@ fn typing_on_replaces_the_suggestion_without_a_gap() {
     let mut sim = Sim::new(&["git status"]);
     sim.prompt();
     sim.type_and_settle(b"g", "g");
-    let sent = sim.type_and_settle(b"i", "gi");
-    let mut expect = b"\x1b[K\r\x1b[K\rP> gi".to_vec();
+    sim.input(b"i");
+    let mut ahead = b"\x1b[K".to_vec();
+    ahead.extend(typed("i"));
+    ahead.extend(drawn("t status"));
+    assert_eq!(
+        sim.take_terminal(),
+        ahead,
+        "the key and its suggestion at once"
+    );
+    sim.take_shell();
+    sim.output(&reply("gi", 2));
+    sim.wait(1);
+    let mut expect = b"\x1b[1D\x1b[K\r\x1b[K\rP> gi".to_vec();
     expect.extend(drawn("t status"));
     assert_eq!(
-        sent, expect,
-        "erase, redraw and the new suggestion are one write"
+        sim.take_terminal(),
+        expect,
+        "back to the shell's cursor, its redraw and the suggestion are one write"
     );
 }
 
@@ -272,9 +296,11 @@ fn no_suggestion_for_an_empty_line_or_when_nothing_matches() {
     let mut sim = Sim::new(&["git status"]);
     sim.prompt();
     let sent = sim.type_and_settle(b"x", "x");
-    assert_eq!(sent, b"\r\x1b[K\rP> x");
+    let mut expect = typed("x");
+    expect.extend_from_slice(b"\x1b[1D\x1b[K\r\x1b[K\rP> x");
+    assert_eq!(sent, expect);
     let sent = sim.type_and_settle(b"\x7f", "");
-    assert_eq!(sent, b"\r\x1b[K\rP> ");
+    assert_eq!(sent, b"\x1b[1D\x1b[K\x1b[1C\x1b[K\r\x1b[K\rP> ");
 }
 
 /// The shell's reply with the cursor one place before the end of `line`.
@@ -719,7 +745,7 @@ fn a_taking_key_does_not_take_when_the_line_is_not_at_the_end() {
 fn a_narrow_row_cuts_the_suggestion_with_an_ellipsis() {
     let mut sim = Sim::new(&["echo 0123456789"]);
     sim.resize(12);
-    sim.prompt();
+    sim.prompt_unknown();
     // "P> echo" is 7 columns; room is 12 - 1 - 7 = 4.
     let sent = sim.type_and_settle(b"echo", "echo");
     let mut expect = b"\r\x1b[K\rP> echo".to_vec();
@@ -776,7 +802,7 @@ fn vi_mode_is_left_alone() {
 #[test]
 fn a_report_that_is_not_one_is_a_quarantine_and_the_stream_goes_on() {
     let mut sim = Sim::new(&["git status"]);
-    sim.prompt();
+    sim.prompt_unknown();
     sim.input(b"g");
     sim.take_shell();
     let mut bytes = b"g".to_vec();
@@ -791,7 +817,7 @@ fn a_report_that_is_not_one_is_a_quarantine_and_the_stream_goes_on() {
 #[test]
 fn a_line_that_is_not_text_gets_no_suggestion_but_probes_go_on() {
     let mut sim = Sim::new(&["git status"]);
-    sim.prompt();
+    sim.prompt_unknown();
     sim.input(b"g");
     sim.take_shell();
     let mut bytes = b"\r\x1b[K\r".to_vec();
@@ -828,7 +854,7 @@ fn the_start_of_a_mark_that_never_finishes_is_given_back() {
 #[test]
 fn a_probe_that_is_answered_with_a_flood_is_given_up_on() {
     let mut sim = Sim::new(&["git status"]);
-    sim.prompt();
+    sim.prompt_unknown();
     sim.input(b"g");
     sim.take_shell();
     let flood = vec![b'x'; HELD_LIMIT];
@@ -857,7 +883,7 @@ fn keys_held_back_when_a_new_prompt_begins_are_not_lost() {
 #[test]
 fn the_end_of_the_shell_lets_go_of_what_is_held() {
     let mut sim = Sim::new(&["git status"]);
-    sim.prompt();
+    sim.prompt_unknown();
     sim.input(b"g");
     sim.output(b"g");
     sim.engine.finish(&mut sim.out);
@@ -877,4 +903,196 @@ fn keys_held_back_when_the_command_starts_are_not_lost() {
     sim.input(b"\x1b");
     sim.output(&mark("R"));
     assert_eq!(sim.take_shell(), b"\x1b");
+}
+
+#[test]
+fn at_a_fresh_prompt_a_key_and_its_suggestion_are_drawn_before_the_shell_answers() {
+    let mut sim = Sim::new(&["git status"]);
+    sim.prompt();
+    sim.input(b"g");
+    let mut ahead = typed("g");
+    ahead.extend(drawn("it status"));
+    assert_eq!(sim.take_terminal(), ahead);
+    assert_eq!(
+        sim.take_shell(),
+        probed(b"g"),
+        "the probe goes all the same"
+    );
+    // The shell's echo and redraw land where it has the cursor.
+    sim.output(b"g");
+    sim.output(&reply("g", 1));
+    let mut expect = b"\x1b[1D\x1b[Kg\r\x1b[K\rP> g".to_vec();
+    expect.extend(drawn("it status"));
+    assert_eq!(sim.take_terminal(), expect);
+}
+
+#[test]
+fn a_wrong_guess_is_put_right_by_the_shells_redraw() {
+    // A key the shell does something else with: the redraw shows what it
+    // did, and the suggestion is for the line as reported.
+    let mut sim = Sim::new(&["git status", "ls -la"]);
+    sim.prompt();
+    sim.input(b"g");
+    sim.take_terminal();
+    sim.take_shell();
+    sim.output(&reply("l", 1));
+    sim.wait(1);
+    let mut expect = b"\x1b[1D\x1b[K\r\x1b[K\rP> l".to_vec();
+    expect.extend(drawn("s -la"));
+    assert_eq!(sim.take_terminal(), expect);
+}
+
+#[test]
+fn backspace_at_the_end_is_drawn_ahead_with_the_shorter_lines_suggestion() {
+    let mut sim = Sim::new(&["git status", "gi"]);
+    sim.prompt();
+    sim.type_and_settle(b"gi", "gi");
+    sim.input(b"\x7f");
+    let mut ahead = b"\x1b[1D\x1b[K".to_vec();
+    ahead.extend(drawn("i"));
+    assert_eq!(sim.take_terminal(), ahead);
+    sim.take_shell();
+    sim.output(b"\x08\x1b[K");
+    sim.output(&reply("g", 1));
+    sim.wait(1);
+    let mut expect = b"\x1b[1C\x1b[K\x08\x1b[K\r\x1b[K\rP> g".to_vec();
+    expect.extend(drawn("i"));
+    assert_eq!(sim.take_terminal(), expect);
+}
+
+#[test]
+fn taking_the_suggestion_is_drawn_ahead_as_typed_text() {
+    let mut sim = Sim::new(&["git status"]);
+    sim.prompt();
+    sim.type_and_settle(b"git", "git");
+    sim.input(b"\x1b[C");
+    assert_eq!(sim.take_shell(), probed(b" status"));
+    let mut ahead = b"\x1b[K".to_vec();
+    ahead.extend(typed(" status"));
+    assert_eq!(sim.take_terminal(), ahead);
+    sim.output(&reply("git status", 10));
+    sim.wait(1);
+    assert_eq!(sim.take_terminal(), b"\x1b[7D\x1b[K\r\x1b[K\rP> git status");
+}
+
+#[test]
+fn a_given_up_probe_clears_what_was_drawn_ahead() {
+    let mut sim = Sim::new(&["git status"]);
+    sim.prompt();
+    sim.input(b"g");
+    sim.take_terminal();
+    sim.output(b"g");
+    sim.wait(100);
+    assert_eq!(sim.take_terminal(), b"\x1b[1D\x1b[Kg");
+}
+
+#[test]
+fn nothing_is_drawn_ahead_where_it_cannot_be_told_for_certain() {
+    // Typed ahead for the prompt: the line is not known.
+    let mut sim = Sim::new(&["git status"]);
+    sim.prompt_unknown();
+    sim.input(b"g");
+    assert_eq!(sim.take_terminal(), b"");
+    // A key that is not plain text.
+    let mut sim = Sim::new(&["echo \u{e9}t\u{e9}"]);
+    sim.prompt();
+    sim.input("e\u{e9}".as_bytes());
+    assert_eq!(sim.take_terminal(), b"", "only ASCII is drawn ahead");
+    // A key after which no probe goes: Tab.
+    let mut sim = Sim::new(&["git status"]);
+    sim.prompt();
+    sim.input(b"g\t");
+    assert_eq!(sim.take_terminal(), b"");
+    // The cursor inside the line.
+    let mut sim = Sim::new(&["git status"]);
+    sim.prompt();
+    sim.input(b"gi\x1b[D");
+    sim.take_shell();
+    sim.output(&reply_with_cursor_back("gi"));
+    sim.wait(1);
+    sim.take_terminal();
+    sim.input(b"x");
+    assert_eq!(sim.take_terminal(), b"", "the cursor is inside the line");
+}
+
+#[test]
+fn nothing_is_drawn_ahead_that_would_reach_the_end_of_the_row() {
+    let mut sim = Sim::new(&["echo 0123456789"]);
+    sim.resize(12);
+    sim.prompt();
+    // "P> " is 3 columns: room is 12 - 1 - 3 = 8, so 8 keys do not fit.
+    sim.input(b"echo 012");
+    assert_eq!(sim.take_terminal(), b"");
+    let mut sim = Sim::new(&["echo 0123456789"]);
+    sim.resize(12);
+    sim.prompt();
+    sim.input(b"echo 01");
+    let mut ahead = typed("echo 01");
+    ahead.extend(drawn("\u{2026}"));
+    assert_eq!(
+        sim.take_terminal(),
+        ahead,
+        "the one column left takes the ellipsis"
+    );
+}
+
+#[test]
+fn a_prompt_after_keys_typed_ahead_or_ctrl_o_is_not_known_empty() {
+    let mut sim = Sim::new(&["git status"]);
+    sim.prompt();
+    sim.type_and_settle(b"ls", "ls");
+    sim.input(b"\r");
+    sim.output(&mark("R"));
+    sim.input(b"g");
+    sim.prompt();
+    sim.take_shell();
+    sim.input(b"i");
+    assert_eq!(sim.take_terminal(), b"", "typed while the command ran");
+    let mut sim = Sim::new(&["git status"]);
+    sim.prompt();
+    sim.type_and_settle(b"ls", "ls");
+    sim.input(b"\x0f");
+    sim.output(&mark("R"));
+    sim.prompt();
+    sim.take_shell();
+    sim.input(b"g");
+    assert_eq!(
+        sim.take_terminal(),
+        b"",
+        "Ctrl-O puts a line in the next prompt"
+    );
+    let mut sim = Sim::new(&["git status"]);
+    sim.prompt();
+    sim.type_and_settle(b"ls", "ls");
+    sim.input(b"\r");
+    sim.output(&mark("R"));
+    sim.prompt();
+    sim.take_shell();
+    sim.input(b"g");
+    assert_ne!(
+        sim.take_terminal(),
+        b"",
+        "nothing typed ahead: the line starts empty"
+    );
+}
+
+#[test]
+fn the_column_is_known_at_a_prompt_that_follows_a_command() {
+    // The command's output is followed from its last carriage return, so
+    // the first key at the next prompt is drawn ahead.
+    let mut sim = Sim::new(&["git status"]);
+    sim.prompt();
+    sim.type_and_settle(b"ls", "ls");
+    sim.input(b"\r");
+    sim.output(&mark("R"));
+    sim.output(b"\r\nfile-one  file-two\r\n");
+    let mut bytes = mark("P;");
+    bytes.extend_from_slice(b"P> ");
+    sim.output(&bytes);
+    sim.take_terminal();
+    sim.take_shell();
+    sim.input(b"g");
+    let mut ahead = typed("g");
+    ahead.extend(drawn("it status"));
+    assert_eq!(sim.take_terminal(), ahead);
 }

@@ -2,7 +2,7 @@
 
 use super::{
     Duration, Engine, Event, Instant, Line, MARK_HOLD, Mark, Out, PARTIAL_HOLD, Phase, Probe,
-    Prompt, REPORT_TIMEOUT, SETTLE, SETTLE_LIMIT, Suggest, Tty, quote, render, text,
+    Prompt, REPORT_TIMEOUT, SETTLE, SETTLE_LIMIT, Suggest, Tty, quote, render,
 };
 use crate::keys::{self, Token};
 
@@ -95,11 +95,13 @@ impl<S: Suggest> Engine<S> {
         if bytes.is_empty() {
             return;
         }
-        // The cursor matters only at a prompt, and the redraw that follows a
-        // probe puts it at the start of the row before anything else, so
-        // what a running command writes need not be followed.
+        // At a prompt every byte is followed. While a command runs only the
+        // end of its output is, so that the column is known when the next
+        // prompt is drawn and its first key can be drawn ahead.
         if matches!(self.phase, Phase::Prompt(_)) {
             self.column.feed(bytes);
+        } else {
+            self.column.follow(bytes);
         }
         if self.probing() && self.held.len().saturating_add(bytes.len()) > super::HELD_LIMIT {
             self.abandon_probe(out);
@@ -126,13 +128,15 @@ impl<S: Suggest> Engine<S> {
         match mark {
             Mark::Prompt { flags } => {
                 self.release_held(out);
-                self.column.forget();
                 if let Phase::Prompt(old) = &mut self.phase {
                     // Keys kept back at the old prompt were meant for the
                     // shell, which is now at a new one (after Ctrl-C, say).
+                    self.typeahead |= !old.input.is_empty();
                     out.to_shell.append(&mut old.input);
                 }
-                self.phase = Phase::Prompt(Box::new(Prompt::new(&flags)));
+                // With nothing typed ahead for it, a prompt's line is empty.
+                let empty = !std::mem::take(&mut self.typeahead);
+                self.phase = Phase::Prompt(Box::new(Prompt::new(&flags, empty)));
                 self.submitted = None;
                 out.events.push(Event::PromptStarted);
             }
@@ -157,6 +161,7 @@ impl<S: Suggest> Engine<S> {
         let line = match &mut self.phase {
             Phase::Prompt(prompt) => {
                 // Keys kept back were meant for the shell.
+                self.typeahead |= !prompt.input.is_empty();
                 out.to_shell.append(&mut prompt.input);
                 match &prompt.line {
                     Line::Known { text, .. } => Some(text.clone()),
@@ -253,15 +258,7 @@ impl<S: Suggest> Engine<S> {
         let Line::Known { text, at_end: true } = &prompt.line else {
             return None;
         };
-        // Never for an empty line, and not for one that is more than a row
-        // of plain text.
-        if text.is_empty() || text.chars().any(char::is_control) {
-            return None;
-        }
-        let command = self.suggester.suggest(text)?;
-        let rest = command.strip_prefix(text.as_str())?;
-        let visible = text::fit(rest, self.column.room()?)?;
-        Some((rest.to_owned(), visible))
+        self.suggestion_for(text, self.column.room()?)
     }
 
     /// The start of a key has waited long enough: it is not going to be

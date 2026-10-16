@@ -40,6 +40,30 @@ impl Style {
     }
 }
 
+/// Append to `out` the bytes that move the cursor `columns` along its row:
+/// right if positive, left if negative, nowhere if zero.
+pub fn step(columns: i64, out: &mut Vec<u8>) {
+    let (count, letter) = if columns < 0 {
+        (columns.unsigned_abs(), 'D')
+    } else {
+        (columns.unsigned_abs(), 'C')
+    };
+    if count == 0 {
+        return;
+    }
+    out.extend_from_slice(format!("\x1b[{count}{letter}").as_bytes());
+}
+
+/// Append to `out` the bytes that write `text`, typed ahead of the shell, at
+/// the cursor, which moves on after it. Automatic wrapping is off for it:
+/// were the column ever miscounted, nothing reaches the next row, where the
+/// shell's redraw could not put it right.
+pub fn typed(text: &str, out: &mut Vec<u8>) {
+    out.extend_from_slice(b"\x1b[?7l");
+    out.extend_from_slice(text.as_bytes());
+    out.extend_from_slice(b"\x1b[?7h");
+}
+
 /// Append to `out` the bytes that draw `text` after the cursor and leave the
 /// cursor where it was.
 pub fn draw(text: &str, style: &Style, out: &mut Vec<u8>) {
@@ -59,6 +83,15 @@ mod tests {
         let mut out = Vec::new();
         draw("tus", &Style::dim(), &mut out);
         assert_eq!(out, b"\x1b7\x1b[?7l\x1b[2mtus\x1b[22m\x1b[?7h\x1b8");
+    }
+
+    #[test]
+    fn the_cursor_steps_either_way_or_stays() {
+        let mut out = Vec::new();
+        step(3, &mut out);
+        step(-2, &mut out);
+        step(0, &mut out);
+        assert_eq!(out, b"\x1b[3C\x1b[2D");
     }
 
     #[test]

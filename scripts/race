@@ -1,0 +1,13 @@
+#!/bin/bash
+# The race in the README: inkling against plain bash, fish and ble.sh, from a
+# key to the right suggestion on the screen, in a release build. fish and
+# ble.sh join when they are named:
+#
+#   RACE_FISH=/path/to/fish RACE_BLESH=/path/to/ble.sh scripts/race
+#
+# RACE_ROWS (default 1000,100000) sets the history sizes; RACE_ONLY=NAME runs
+# one contender; RACE_DUMP=1 prints the row whenever a key is missed.
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+cargo test --release --test race --quiet -- --ignored --nocapture --test-threads=1 2>&1 |
+  grep -v -e '^running' -e '^test result' -e '^\.$' -e '^$'
