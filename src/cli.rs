@@ -138,7 +138,7 @@ fn replay(tune: bool, spec: Option<&str>) -> Result<i32> {
 fn report(scores: &[inkling::replay::Score], knowing: &inkling::replay::Score) -> Result<()> {
     let names = [
         "fish's order (most recent)",
-        "inkling 0.1 (recent, this directory first)",
+        "inkling before (recent, this directory first)",
         "inkling (likely, by directory, project, sequence)",
     ];
     if let Some(first) = scores.first() {
