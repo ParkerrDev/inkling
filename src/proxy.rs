@@ -8,14 +8,16 @@
 //! The loop knows nothing of suggestions: the [`Engine`] decides what to do
 //! with each chunk, and this carries it out.
 
+use std::cell::Cell;
 use std::ffi::{OsStr, OsString};
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
@@ -96,8 +98,9 @@ fn prepare(settings: &Settings) -> Result<(Proxy, RawMode)> {
         fcntl_getfl(&master).map_err(|e| Error::io("read master flags", e))? | OFlags::NONBLOCK;
     fcntl_setfl(&master, nonblocking).map_err(|e| Error::io("set master flags", e))?;
     let signals = Signals::install()?;
-    // The shell starts while the history is read.
-    let brain = Brain::load(&settings.env);
+    // The history is read on a thread of its own, so that the shell's first
+    // prompt waits for nothing; until it is in, nothing is suggested.
+    let (brain, loading) = load_aside(&settings.env);
     let columns = usize::from(size.ws_col);
     let engine = Engine::new(&nonce, columns, settings.style.clone(), brain);
     let raw = RawMode::enter(&settings_of_terminal)?;
@@ -108,7 +111,39 @@ fn prepare(settings: &Settings) -> Result<(Proxy, RawMode)> {
             .open(path)
             .ok()
     });
-    Ok((Proxy::new(master, child, engine, signals, trace), raw))
+    let mut proxy = Proxy::new(master, child, engine, signals, trace);
+    proxy.loading = loading;
+    Ok((proxy, raw))
+}
+
+/// Start reading the history on a thread of its own: an empty brain to be
+/// going on with, and where the full one will come. Where no thread can be
+/// had, the history is read here and now.
+fn load_aside(env: &crate::history::Env) -> (Brain, Option<Loading>) {
+    let Ok((woken, wake)) = UnixStream::pair() else {
+        return (Brain::load(env), None);
+    };
+    let (send, receive) = std::sync::mpsc::channel();
+    let env_for_thread = env.clone();
+    let started = std::thread::Builder::new()
+        .name("inkling history".to_owned())
+        .spawn(move || {
+            // Nobody may be waiting any more: that is fine.
+            let _ = send.send(Brain::load(&env_for_thread));
+            // The byte that wakes the loop; the end closing would too.
+            let _ = (&wake).write(b"!");
+        });
+    match started {
+        Ok(_) => (Brain::empty(), Some(Loading { receive, woken })),
+        Err(_) => (Brain::load(env), None),
+    }
+}
+
+/// The history being read on its thread: where it will come, and what is
+/// written to when it has.
+struct Loading {
+    receive: Receiver<Brain>,
+    woken: UnixStream,
 }
 
 /// The real terminal's settings and size.
@@ -269,18 +304,27 @@ fn drain(mut pipe: &UnixStream) {
     }
 }
 
-/// What the terminal looks like, as the engine asks.
+/// What the terminal looks like, as the engine asks. Each question goes to
+/// the kernel once for each thing the engine is handed: within one key or
+/// one read of output the answer does not change.
 struct Facts<'a> {
     master: BorrowedFd<'a>,
     shell: Pid,
+    front: Cell<Option<bool>>,
+    mode: Cell<Option<Mode>>,
 }
 
-impl Tty for Facts<'_> {
-    fn shell_in_front(&self) -> bool {
-        tcgetpgrp(self.master).is_ok_and(|group| group == self.shell)
+impl<'a> Facts<'a> {
+    fn new(master: BorrowedFd<'a>, shell: Pid) -> Self {
+        Self {
+            master,
+            shell,
+            front: Cell::new(None),
+            mode: Cell::new(None),
+        }
     }
 
-    fn mode(&self) -> Mode {
+    fn ask_mode(&self) -> Mode {
         let Ok(settings) = tcgetattr(self.master) else {
             return Mode::Other;
         };
@@ -298,6 +342,26 @@ impl Tty for Facts<'_> {
     }
 }
 
+impl Tty for Facts<'_> {
+    fn shell_in_front(&self) -> bool {
+        if let Some(known) = self.front.get() {
+            return known;
+        }
+        let front = tcgetpgrp(self.master).is_ok_and(|group| group == self.shell);
+        self.front.set(Some(front));
+        front
+    }
+
+    fn mode(&self) -> Mode {
+        if let Some(known) = self.mode.get() {
+            return known;
+        }
+        let mode = self.ask_mode();
+        self.mode.set(Some(mode));
+        mode
+    }
+}
+
 /// What woke the loop.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Which {
@@ -307,6 +371,8 @@ enum Which {
     Winch,
     Child,
     End,
+    /// The history has been read.
+    Loaded,
 }
 
 /// Why the loop ended.
@@ -330,6 +396,8 @@ struct Proxy {
     cwd: PathBuf,
     trace: Option<std::fs::File>,
     started: Instant,
+    /// Where the history comes from while it is still being read.
+    loading: Option<Loading>,
 }
 
 impl Proxy {
@@ -354,6 +422,23 @@ impl Proxy {
             output: vec![0; CHUNK],
             trace,
             started: Instant::now(),
+            loading: None,
+        }
+    }
+
+    /// Put the history in place if it has been read, where the shell is now.
+    fn take_loaded(&mut self) {
+        let Some(loading) = &self.loading else { return };
+        match loading.receive.try_recv() {
+            Ok(mut brain) => {
+                let cwd = std::fs::read_link(&self.cwd).ok();
+                brain.prompt(cwd.as_deref());
+                *self.engine.suggester_mut() = brain;
+                self.loading = None;
+            }
+            Err(TryRecvError::Empty) => {}
+            // The thread is gone without it: suggestions from this session only.
+            Err(TryRecvError::Disconnected) => self.loading = None,
         }
     }
 
@@ -386,6 +471,7 @@ impl Proxy {
                 .deadline()
                 .map(|at| at.saturating_duration_since(now));
             let ready = self.wait(timeout)?;
+            self.take_loaded();
             let now = Instant::now();
             if ready.contains(&Which::End) {
                 return Ok(Over::Hangup);
@@ -432,6 +518,10 @@ impl Proxy {
             fds.push(PollFd::new(pipe, PollFlags::IN));
             which.push(kind);
         }
+        if let Some(loading) = &self.loading {
+            fds.push(PollFd::new(&loading.woken, PollFlags::IN));
+            which.push(Which::Loaded);
+        }
         let timespec = timeout.map(|d| Timespec {
             tv_sec: i64::try_from(d.as_secs()).unwrap_or(i64::MAX),
             tv_nsec: i64::from(d.subsec_nanos()),
@@ -465,10 +555,7 @@ impl Proxy {
             Err(Errno::AGAIN | Errno::INTR) => return Ok(true),
             Err(source) => return Err(Error::io("read from the shell", source)),
         };
-        let facts = Facts {
-            master: self.master.as_fd(),
-            shell: self.shell,
-        };
+        let facts = Facts::new(self.master.as_fd(), self.shell);
         let bytes = self.output.get(..count).unwrap_or_default();
         trace(&mut self.trace, self.started, "from the shell", bytes);
         self.engine.on_output(now, bytes, &facts, &mut self.out);
@@ -484,10 +571,7 @@ impl Proxy {
             Err(Errno::AGAIN | Errno::INTR) => return Ok(true),
             Err(source) => return Err(Error::io("read from the terminal", source)),
         };
-        let facts = Facts {
-            master: self.master.as_fd(),
-            shell: self.shell,
-        };
+        let facts = Facts::new(self.master.as_fd(), self.shell);
         let bytes = self.input.get(..count).unwrap_or_default();
         trace(&mut self.trace, self.started, "from the person", bytes);
         self.engine.on_input(now, bytes, &facts, &mut self.out);
@@ -499,10 +583,7 @@ impl Proxy {
         if self.engine.deadline().is_none_or(|at| at > now) {
             return Ok(());
         }
-        let facts = Facts {
-            master: self.master.as_fd(),
-            shell: self.shell,
-        };
+        let facts = Facts::new(self.master.as_fd(), self.shell);
         self.engine.on_tick(now, &facts, &mut self.out);
         self.apply()
     }
@@ -608,10 +689,7 @@ impl Proxy {
         match rustix::io::read(&self.master, self.output.as_mut_slice()) {
             Ok(0) | Err(Errno::IO | Errno::AGAIN) => Ok(false),
             Ok(count) => {
-                let facts = Facts {
-                    master: self.master.as_fd(),
-                    shell: self.shell,
-                };
+                let facts = Facts::new(self.master.as_fd(), self.shell);
                 let bytes = self.output.get(..count).unwrap_or_default();
                 self.engine.on_output(now, bytes, &facts, &mut self.out);
                 self.apply()?;

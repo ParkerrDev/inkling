@@ -131,7 +131,8 @@ mod tests {
     #[test]
     fn backspace_brings_it_back_and_an_empty_line_has_none() {
         let (_sandbox, mut shell) = shell_with_history();
-        shell.type_and_settle(b"gx");
+        // Nothing in the history, and no program, starts with "gZ".
+        shell.type_and_settle(b"gZ");
         assert_eq!(shell.dim_on_cursor_row(), "");
         shell.type_and_settle(b"\x7f");
         assert_eq!(shell.dim_on_cursor_row(), "it status");
@@ -471,6 +472,44 @@ mod tests {
         shell.command("cd /tmp");
         shell.type_and_settle(b"make ");
         assert_eq!(shell.dim_on_cursor_row(), "elsewhere");
+    }
+
+    #[test]
+    fn commands_run_in_this_project_come_before_more_recent_ones_elsewhere() {
+        let sandbox = Sandbox::new();
+        let project = sandbox.home().join("proj");
+        std::fs::create_dir_all(project.join(".git")).unwrap();
+        std::fs::create_dir_all(project.join("src")).unwrap();
+        let src = project.join("src").display().to_string();
+        sandbox.atuin_db(&[
+            ("cargo test --workspace", &src),
+            ("cargo tauri dev", "/elsewhere"),
+        ]);
+        let mut shell = sandbox.shell("");
+        shell.command(&format!("cd {}", project.display()));
+        shell.type_and_settle(b"cargo t");
+        assert_eq!(shell.dim_on_cursor_row(), "est --workspace");
+    }
+
+    #[test]
+    fn a_cd_into_a_directory_that_is_gone_is_not_suggested() {
+        let sandbox = Sandbox::new();
+        let here = sandbox.home().display().to_string();
+        std::fs::create_dir(sandbox.home().join("kept")).unwrap();
+        sandbox.atuin_db(&[("cd kept", &here), ("cd removed", &here)]);
+        let mut shell = sandbox.shell("");
+        shell.type_and_settle(b"cd ");
+        assert_eq!(shell.dim_on_cursor_row(), "kept");
+    }
+
+    #[test]
+    fn with_nothing_in_the_history_a_file_name_is_finished() {
+        let sandbox = Sandbox::new();
+        sandbox.write_history(&["ls"]);
+        std::fs::write(sandbox.home().join("notes-for-tuesday.md"), b"").unwrap();
+        let mut shell = sandbox.shell("");
+        shell.type_and_settle(b"cat notes");
+        assert_eq!(shell.dim_on_cursor_row(), "-for-tuesday.md");
     }
 
     struct Tmux(String);

@@ -25,12 +25,12 @@ impl Tty for Fake {
 struct Words(Vec<&'static str>);
 
 impl Suggest for Words {
-    fn suggest(&self, line: &str) -> Option<&str> {
+    fn suggest(&self, line: &str) -> Option<Cow<'_, str>> {
         self.0
             .iter()
             .rev()
             .find(|c| c.starts_with(line) && c.len() > line.len())
-            .copied()
+            .map(|c| Cow::Borrowed(*c))
     }
 }
 

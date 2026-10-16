@@ -13,12 +13,21 @@ use std::time::Duration;
 use rusqlite::{Connection, OpenFlags};
 
 use crate::error::{Error, Result};
-use crate::index::Index;
+use crate::history::Past;
+use crate::index::{Index, Run};
 
 /// The most rows read in one go.
 const MAX_ROWS: i64 = 1_000_000;
 /// The exit status of a command that was not found.
 const NOT_FOUND: i64 = 127;
+
+/// Whether a command that ended with `exit` went well, as far as choosing it
+/// again goes: it did, or nobody knows (-1, for history Atuin imported), or
+/// it was stopped by Ctrl-C or by the end of a pipe, which are how a program
+/// that runs until stopped is left.
+fn went_well(exit: i64) -> bool {
+    matches!(exit, 0 | -1 | 130 | 141)
+}
 
 /// An open Atuin database.
 #[derive(Debug)]
@@ -55,7 +64,7 @@ impl Atuin {
         // The columns this reads, so that a database that lacks them is found
         // out now and not at the first prompt.
         conn.prepare(
-            "SELECT rowid, command, cwd, timestamp, exit, deleted_at FROM history LIMIT 0",
+            "SELECT rowid, command, cwd, timestamp, exit, session, deleted_at FROM history LIMIT 0",
         )
         .map_err(failed)?;
         let version = Self::data_version(&conn).map_err(failed)?;
@@ -115,11 +124,46 @@ impl Atuin {
         self.read_new(index)
     }
 
+    /// Every command, oldest first, as [`Atuin::load`] would take them.
+    ///
+    /// # Errors
+    ///
+    /// When the database cannot be read.
+    pub fn past(&self) -> Result<Vec<Past>> {
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT command, cwd, exit, session FROM history \
+                 WHERE deleted_at IS NULL ORDER BY rowid LIMIT ?1",
+            )
+            .map_err(|source| self.failed(source))?;
+        let mut rows = statement
+            .query([MAX_ROWS])
+            .map_err(|source| self.failed(source))?;
+        let mut past = Vec::new();
+        for _ in 0..MAX_ROWS {
+            let Some(row) = rows.next().map_err(|source| self.failed(source))? else {
+                break;
+            };
+            let exit = row.get::<_, i64>(2).unwrap_or(0);
+            let text = |at: usize| row.get_ref(at).ok().and_then(|value| value.as_str().ok());
+            if let (false, Some(command), Some(cwd)) = (exit == NOT_FOUND, text(0), text(1)) {
+                past.push(Past {
+                    command: command.to_owned(),
+                    cwd: cwd.to_owned(),
+                    session: text(3).unwrap_or_default().to_owned(),
+                    ok: went_well(exit),
+                });
+            }
+        }
+        Ok(past)
+    }
+
     fn read_new(&mut self, index: &mut Index) -> Result<usize> {
         let mut statement = self
             .conn
             .prepare_cached(
-                "SELECT rowid, command, cwd, timestamp, exit FROM history \
+                "SELECT rowid, command, cwd, exit, session FROM history \
                  WHERE rowid > ?1 AND deleted_at IS NULL ORDER BY rowid LIMIT ?2",
             )
             .map_err(|source| self.failed(source))?;
@@ -134,19 +178,23 @@ impl Atuin {
             };
             read = read.saturating_add(1);
             last = row.get(0).unwrap_or(last);
-            if row.get::<_, i64>(4).unwrap_or(0) == NOT_FOUND {
+            let exit = row.get::<_, i64>(3).unwrap_or(0);
+            if exit == NOT_FOUND {
                 continue;
             }
             // Text that is not text, or a row without its fields, is not a
             // command to suggest; the rest of the table is still good.
-            let (Some(command), Some(cwd), Ok(when)) = (
-                row.get_ref(1).ok().and_then(|value| value.as_str().ok()),
-                row.get_ref(2).ok().and_then(|value| value.as_str().ok()),
-                row.get::<_, i64>(3),
-            ) else {
+            let text = |at: usize| row.get_ref(at).ok().and_then(|value| value.as_str().ok());
+            let (Some(command), Some(cwd)) = (text(1), text(2)) else {
                 continue;
             };
-            let _ = index.push(command, cwd, when);
+            let run = Run {
+                command,
+                cwd,
+                ok: went_well(exit),
+                session: text(4).unwrap_or_default(),
+            };
+            let _ = index.push(&run);
         }
         drop(rows);
         self.seen = last;
@@ -198,7 +246,7 @@ mod tests {
         index.commit();
         assert_eq!(index.suggest("git s"), Some("git stash"));
         assert_eq!(index.suggest("cargo"), Some("cargo build"));
-        index.set_cwd("/p");
+        index.set_context("/p", None);
         assert_eq!(index.suggest("g"), Some("git stash"));
     }
 

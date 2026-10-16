@@ -69,6 +69,15 @@ impl Env {
     }
 }
 
+/// One command from the past, owned, as the replay reads it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Past {
+    pub command: String,
+    pub cwd: String,
+    pub session: String,
+    pub ok: bool,
+}
+
 /// A source of commands.
 #[derive(Debug)]
 pub enum Source {
@@ -122,6 +131,18 @@ impl Source {
         };
         index.commit();
         Ok(read)
+    }
+
+    /// Every command, oldest first, for a replay.
+    ///
+    /// # Errors
+    ///
+    /// When the source cannot be read.
+    pub fn past(&self) -> Result<Vec<Past>> {
+        match self {
+            Self::Atuin(source) => source.past(),
+            Self::File(source) => source.past(),
+        }
     }
 
     /// Read what is new since the last time. Returns how many runs.

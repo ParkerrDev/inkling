@@ -15,7 +15,8 @@ kept as behaviour, written again here in Rust and shell:
     the blanks around it (ble.sh's insert-word, whose rule is "blanks, then
     the non-blanks, then blanks").
   * Any other key withdraws the suggestion and is then handled as usual.
-  * The history is the source, the most recent command with the prefix first.
+  * The history is the source, the most recent command with the prefix first
+    (the order inkling started from; it has since put its own on it).
 
 No source text of ble.sh is in this repository, so none of its licence's
 conditions on redistribution apply; its notice is kept here as the credit it is

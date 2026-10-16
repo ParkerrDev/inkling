@@ -20,10 +20,12 @@ pub mod index;
 pub mod init;
 pub mod keys;
 pub mod osc;
+pub mod paths;
 pub mod proxy;
 pub mod pty;
 pub mod quote;
 pub mod render;
+pub mod replay;
 pub mod session;
 pub mod text;
 

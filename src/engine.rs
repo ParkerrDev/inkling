@@ -36,6 +36,7 @@
 //!   holds the terminal, inside a paste, or in the same write as a key that
 //!   runs the line.
 
+use std::borrow::Cow;
 use std::time::{Duration, Instant};
 
 use crate::column::Column;
@@ -66,13 +67,14 @@ const PASTE_END: &[u8] = b"\x1b[201~";
 /// Where suggestions come from.
 pub trait Suggest {
     /// The command to suggest for `line`: one that starts with it and is
-    /// longer.
-    fn suggest(&self, line: &str) -> Option<&str>;
+    /// longer. Taken from the history as it is, or made (a file's name
+    /// finished).
+    fn suggest(&self, line: &str) -> Option<Cow<'_, str>>;
 }
 
 impl Suggest for crate::index::Index {
-    fn suggest(&self, line: &str) -> Option<&str> {
-        Self::suggest(self, line)
+    fn suggest(&self, line: &str) -> Option<Cow<'_, str>> {
+        Self::suggest(self, line).map(Cow::Borrowed)
     }
 }
 

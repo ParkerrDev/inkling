@@ -12,7 +12,8 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
-use crate::index::Index;
+use crate::history::Past;
+use crate::index::{Index, Run};
 
 /// How much of the end of the file is read at most.
 const MAX_BYTES: u64 = 32 << 20;
@@ -23,19 +24,13 @@ pub struct HistFile {
     path: PathBuf,
     /// Where the last read stopped.
     offset: u64,
-    /// The recency to give the next line: later lines are more recent.
-    next: i64,
 }
 
 impl HistFile {
     /// A history file at `path`, not yet read.
     #[must_use]
     pub fn new(path: PathBuf) -> Self {
-        Self {
-            path,
-            offset: 0,
-            next: 1,
-        }
+        Self { path, offset: 0 }
     }
 
     /// Where the file is.
@@ -51,8 +46,40 @@ impl HistFile {
     /// When the file cannot be read.
     pub fn load(&mut self, index: &mut Index) -> Result<usize> {
         self.offset = 0;
-        self.next = 1;
         self.read_from(index)
+    }
+
+    /// Every command, oldest first (of the file's last part, if it is huge),
+    /// for a replay. A history file knows no directories or sessions.
+    ///
+    /// # Errors
+    ///
+    /// When the file cannot be read.
+    pub fn past(&self) -> Result<Vec<Past>> {
+        let bytes =
+            std::fs::read(&self.path).map_err(|source| Error::io("history file", source))?;
+        let most = usize::try_from(MAX_BYTES).unwrap_or(usize::MAX);
+        let start = bytes.len().saturating_sub(most);
+        let mut tail = bytes.get(start..).unwrap_or_default();
+        if start > 0 {
+            // The part read begins in the middle of a line.
+            let stump = tail
+                .iter()
+                .position(|b| *b == b'\n')
+                .map_or(0, |at| at.saturating_add(1));
+            tail = tail.get(stump..).unwrap_or_default();
+        }
+        Ok(tail
+            .split(|b| *b == b'\n')
+            .filter_map(|line| std::str::from_utf8(line).ok())
+            .filter(|line| !line.is_empty() && !is_timestamp(line))
+            .map(|command| Past {
+                command: command.to_owned(),
+                cwd: String::new(),
+                session: String::new(),
+                ok: true,
+            })
+            .collect())
     }
 
     /// Read what has been added. Returns how many lines were taken in.
@@ -104,10 +131,10 @@ impl HistFile {
             lines = lines.get(stump..).unwrap_or_default();
         }
         self.offset = skip_to.saturating_add(u64::try_from(complete).unwrap_or(0));
-        Ok(self.take_lines(lines, index))
+        Ok(Self::take_lines(lines, index))
     }
 
-    fn take_lines(&mut self, lines: &[u8], index: &mut Index) -> usize {
+    fn take_lines(lines: &[u8], index: &mut Index) -> usize {
         let mut taken: usize = 0;
         for line in lines.split(|b| *b == b'\n') {
             let Ok(text) = std::str::from_utf8(line) else {
@@ -116,8 +143,15 @@ impl HistFile {
             if is_timestamp(text) {
                 continue;
             }
-            if index.push(text, "", self.next).is_ok() {
-                self.next = self.next.saturating_add(1);
+            // A history file knows neither the directory, nor how the
+            // command went, nor which shell ran it: one session of them all.
+            let run = Run {
+                command: text,
+                cwd: "",
+                ok: true,
+                session: "",
+            };
+            if index.push(&run).is_ok() {
                 taken = taken.saturating_add(1);
             }
         }

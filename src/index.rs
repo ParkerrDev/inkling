@@ -1,22 +1,31 @@
 //! The history, ready to be asked "what comes after this?" in microseconds.
 //!
-//! Every distinct command is kept once, in a list sorted by its text, beside
-//! a list of when it was last run. The commands that start with what has been
-//! typed are then one run of that list, found by two binary searches, and the
-//! most recent of them is the largest number in a stretch of the other list.
-//! Nothing is allocated or copied to ask.
+//! Every distinct command is kept once, in a list sorted by its text, so the
+//! commands that start with what has been typed are one run of that list,
+//! found by two binary searches. Beside it, for each command, what it is
+//! worth in the whole history; and for each directory, a scope of the
+//! commands run there, searchable the same way. The project the shell is in
+//! gets a scope too, made from the directories under it. And for each
+//! command, what was run next in the same session, and how often.
 //!
-//! As fish does, the most recent command wins, but one that was run in the
-//! directory the shell is in comes before all that were not. So there is a
-//! second list of the same shape for the current directory, built once when
-//! the directory changes.
+//! [`Index::ranked`] puts the commands that fit in order by the mixture
+//! described in [`rank`]. Only the best few of the whole history's run need
+//! a score worked out, since a command that the project, the directory and
+//! the last command know nothing of scores by its worth alone.
 //!
 //! Commands come in by [`Index::push`] and become visible at
-//! [`Index::commit`], which merges a batch in one pass: loading a hundred
-//! thousand commands is a sort, not a hundred thousand insertions.
+//! [`Index::commit`], which takes a batch in one pass: loading a hundred
+//! thousand runs is a sort, not a hundred thousand insertions.
 
-use std::cmp::Ordering;
-use std::collections::HashMap;
+pub mod rank;
+mod scope;
+mod worth;
+
+use std::collections::{HashMap, HashSet};
+
+pub use rank::{Best, Weights};
+use scope::Scope;
+use worth::NONE;
 
 use crate::text::is_typeable;
 
@@ -27,37 +36,25 @@ const MAX_COMMAND_BYTES: usize = 2048;
 const MAX_ROWS: usize = 2_000_000;
 /// The most bytes of command text kept.
 const MAX_ARENA: usize = 256 << 20;
+/// The most of a run of the whole history looked through for its best.
+const MAX_SCAN: usize = 1 << 18;
+/// The most of a run in a directory or a project that gets a score.
+const MAX_LOCAL: usize = 4096;
+/// The most different next commands remembered after one command.
+const MAX_FOLLOWS: usize = 64;
+/// The most sessions followed at once while reading.
+const MAX_SESSIONS: usize = 1 << 16;
 
-/// Where a command's text lies in the arena.
+/// One run of a command, as a source reports it.
 #[derive(Clone, Copy, Debug)]
-struct Span {
-    start: u32,
-    len: u32,
-}
-
-/// One command run, waiting to be committed.
-#[derive(Debug)]
-struct Row {
-    text: Span,
-    dir: u32,
-    when: i64,
-}
-
-/// A command run in a directory, once committed.
-#[derive(Clone, Copy, Debug)]
-struct DirRow {
-    id: u32,
-    when: i64,
-}
-
-/// The view of the history for one directory.
-#[derive(Debug, Default)]
-struct Local {
-    dir: Option<u32>,
-    /// How many rows the directory had when this was built.
-    built_from: usize,
-    ids: Vec<u32>,
-    when: Vec<i64>,
+pub struct Run<'a> {
+    pub command: &'a str,
+    /// The directory it ran in, or empty if that is not known.
+    pub cwd: &'a str,
+    /// It went well, or nobody knows (only a failure counts against it).
+    pub ok: bool,
+    /// The session it ran in: one shell, from start to exit.
+    pub session: &'a str,
 }
 
 /// Why a command was not taken in.
@@ -73,23 +70,132 @@ pub enum Refused {
     Full,
 }
 
-/// The history, searchable by prefix.
+/// How the commands that fit are put in order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Order {
+    /// By the chance of being meant (see [`rank`]).
+    Likely,
+    /// The most recent, as fish has it.
+    Recent,
+    /// The most recent, but one run in this directory before all others, as
+    /// inkling had it before.
+    RecentHereFirst,
+}
+
+/// Where a command's text lies in the arena.
+#[derive(Clone, Copy, Debug)]
+struct Span {
+    start: u32,
+    len: u32,
+}
+
+/// A run waiting to be committed.
+#[derive(Debug)]
+struct Pending {
+    text: Span,
+    dir: u32,
+    seq: u32,
+    ok: bool,
+    session: u32,
+}
+
+/// What came after one command, and how often.
 #[derive(Debug, Default)]
+struct Follows {
+    next: Vec<(u32, u32)>,
+    total: u32,
+}
+
+impl Follows {
+    fn add(&mut self, id: u32) {
+        self.total = self.total.saturating_add(1);
+        if let Some(entry) = self.next.iter_mut().find(|(next, _)| *next == id) {
+            entry.1 = entry.1.saturating_add(1);
+        } else if self.next.len() < MAX_FOLLOWS {
+            self.next.push((id, 1));
+        }
+    }
+
+    fn share(&self, id: u32) -> f64 {
+        let count = self
+            .next
+            .iter()
+            .find(|(next, _)| *next == id)
+            .map_or(0, |entry| entry.1);
+        if self.total == 0 {
+            return 0.0;
+        }
+        f64::from(count) / f64::from(self.total)
+    }
+}
+
+/// The scope of the project the shell is in.
+#[derive(Debug)]
+struct Project {
+    root: String,
+    scope: Scope,
+}
+
+/// Whether directory `dir` is `root` or under it.
+fn under(dir: &str, root: &str) -> bool {
+    dir.strip_prefix(root)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/') || root.ends_with('/'))
+}
+
+fn slice(arena: &str, span: Span) -> &str {
+    let start = usize::try_from(span.start).unwrap_or(0);
+    let end = start.saturating_add(usize::try_from(span.len).unwrap_or(0));
+    arena.get(start..end).unwrap_or_default()
+}
+
+fn text_of<'a>(arena: &'a str, spans: &[Span], id: u32) -> &'a str {
+    let span = usize::try_from(id)
+        .ok()
+        .and_then(|at| spans.get(at))
+        .copied()
+        .unwrap_or(Span { start: 0, len: 0 });
+    slice(arena, span)
+}
+
+/// The history, searchable by prefix and put in order by what is likely.
+#[derive(Debug)]
 pub struct Index {
+    weights: Weights,
     /// The text of every distinct command, one after another.
     arena: String,
+    /// Where each command's text is, by id.
     spans: Vec<Span>,
     /// Command ids, ordered by the text.
     sorted: Vec<u32>,
-    /// When each command in `sorted` was last run, in the same order.
-    recent: Vec<i64>,
-    pending: Vec<Row>,
+    /// Where each id is in `sorted`.
+    pos: Vec<u32>,
+    /// The latest run of each command, in the order of `sorted`.
+    last: Vec<u32>,
+    /// What each command is worth in the whole history, in that order.
+    anchor: Vec<f64>,
+    /// The whole history's runs together.
+    mass: f64,
+    pending: Vec<Pending>,
     pending_arena: String,
     dir_ids: HashMap<String, u32>,
-    by_dir: Vec<Vec<DirRow>>,
-    local: Local,
+    dir_names: Vec<String>,
+    dirs: Vec<Scope>,
+    session_ids: HashMap<String, u32>,
+    /// The last command of each session, while reading.
+    session_last: HashMap<u32, u32>,
+    follows: HashMap<u32, Follows>,
+    /// How many runs have been taken in: the clock runs fade by.
+    seq: u32,
     cwd: String,
-    rows: usize,
+    project: Option<Project>,
+    /// The command run last in this shell.
+    prev: Option<u32>,
+}
+
+impl Default for Index {
+    fn default() -> Self {
+        Self::with_weights(Weights::default())
+    }
 }
 
 impl Index {
@@ -97,6 +203,33 @@ impl Index {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// An empty index that orders by `weights`.
+    #[must_use]
+    pub fn with_weights(weights: Weights) -> Self {
+        Self {
+            weights,
+            arena: String::new(),
+            spans: Vec::new(),
+            sorted: Vec::new(),
+            pos: Vec::new(),
+            last: Vec::new(),
+            anchor: Vec::new(),
+            mass: NONE,
+            pending: Vec::new(),
+            pending_arena: String::new(),
+            dir_ids: HashMap::new(),
+            dir_names: Vec::new(),
+            dirs: Vec::new(),
+            session_ids: HashMap::new(),
+            session_last: HashMap::new(),
+            follows: HashMap::new(),
+            seq: 0,
+            cwd: String::new(),
+            project: None,
+            prev: None,
+        }
     }
 
     /// How many distinct commands are searchable.
@@ -114,21 +247,26 @@ impl Index {
     /// How many runs of commands are known, counting repeats.
     #[must_use]
     pub fn rows(&self) -> usize {
-        self.rows
+        usize::try_from(self.seq).unwrap_or(usize::MAX)
     }
 
     /// Forget everything.
     pub fn clear(&mut self) {
-        *self = Self::default();
+        *self = Self::with_weights(self.weights);
     }
 
-    /// Take in a command that was run in `cwd` at time `when` (any unit, as
-    /// long as later is larger). It is not searchable until [`Index::commit`].
+    fn text(&self, id: u32) -> &str {
+        text_of(&self.arena, &self.spans, id)
+    }
+
+    /// Take in a run of a command. It is not searchable until
+    /// [`Index::commit`].
     ///
     /// # Errors
     ///
     /// Says why the command was left out.
-    pub fn push(&mut self, command: &str, cwd: &str, when: i64) -> Result<(), Refused> {
+    pub fn push(&mut self, run: &Run<'_>) -> Result<(), Refused> {
+        let command = run.command;
         if command.starts_with(char::is_whitespace) {
             return Err(Refused::Hidden);
         }
@@ -138,21 +276,24 @@ impl Index {
         if command.len() > MAX_COMMAND_BYTES {
             return Err(Refused::TooLong);
         }
-        if self.rows >= MAX_ROWS
-            || self.arena.len().saturating_add(self.pending_arena.len()) > MAX_ARENA
-        {
+        let full = self.rows() >= MAX_ROWS
+            || self.arena.len().saturating_add(self.pending_arena.len()) > MAX_ARENA;
+        if full {
             return Err(Refused::Full);
         }
         let start = u32::try_from(self.pending_arena.len()).map_err(|_| Refused::Full)?;
         let len = u32::try_from(command.len()).map_err(|_| Refused::TooLong)?;
-        let dir = self.dir_id(cwd)?;
+        let dir = self.dir_id(run.cwd)?;
+        let session = self.session_id(run.session);
+        self.seq = self.seq.checked_add(1).ok_or(Refused::Full)?;
         self.pending_arena.push_str(command);
-        self.pending.push(Row {
+        self.pending.push(Pending {
             text: Span { start, len },
             dir,
-            when,
+            seq: self.seq,
+            ok: run.ok,
+            session,
         });
-        self.rows = self.rows.saturating_add(1);
         Ok(())
     }
 
@@ -160,19 +301,25 @@ impl Index {
         if let Some(&id) = self.dir_ids.get(cwd) {
             return Ok(id);
         }
-        let id = u32::try_from(self.by_dir.len()).map_err(|_| Refused::Full)?;
+        let id = u32::try_from(self.dirs.len()).map_err(|_| Refused::Full)?;
         self.dir_ids.insert(cwd.to_owned(), id);
-        self.by_dir.push(Vec::new());
+        self.dir_names.push(cwd.to_owned());
+        self.dirs.push(Scope::default());
         Ok(id)
     }
 
-    fn text(&self, id: u32) -> &str {
-        let span = usize::try_from(id)
-            .ok()
-            .and_then(|at| self.spans.get(at))
-            .copied()
-            .unwrap_or(Span { start: 0, len: 0 });
-        slice(&self.arena, span)
+    fn session_id(&mut self, session: &str) -> u32 {
+        if let Some(&id) = self.session_ids.get(session) {
+            return id;
+        }
+        if self.session_ids.len() >= MAX_SESSIONS {
+            // Old sessions are over; what they ran last is forgotten.
+            self.session_ids.clear();
+            self.session_last.clear();
+        }
+        let id = u32::try_from(self.session_ids.len()).unwrap_or(u32::MAX);
+        self.session_ids.insert(session.to_owned(), id);
+        id
     }
 
     /// Make everything pushed so far searchable.
@@ -180,350 +327,357 @@ impl Index {
         if self.pending.is_empty() {
             return;
         }
-        let mut rows = std::mem::take(&mut self.pending);
-        // The text of the pending rows is borrowed from here, apart from
-        // `self`, which is changed as the rows are taken in.
+        let rows = std::mem::take(&mut self.pending);
         let arena = std::mem::take(&mut self.pending_arena);
-        rows.sort_by(|a, b| slice(&arena, a.text).cmp(slice(&arena, b.text)));
-        let mut fresh: Vec<(u32, i64)> = Vec::new();
-        let mut at = 0;
-        // Each pass takes one run of rows with the same text; every pass
-        // takes at least one row.
-        for _ in 0..rows.len() {
-            let Some(first) = rows.get(at) else { break };
-            let text = slice(&arena, first.text);
-            let rest = rows.get(at..).unwrap_or_default();
-            let run = rest
-                .iter()
-                .take_while(|row| slice(&arena, row.text) == text)
-                .count();
-            let group = rest.get(..run).unwrap_or_default();
-            let latest = group.iter().map(|row| row.when).max().unwrap_or(0);
-            let (id, is_new) = self.id_for(text, latest);
-            if is_new {
-                fresh.push((id, latest));
-            }
-            for row in group {
-                if let Some(rows_of_dir) = usize::try_from(row.dir)
-                    .ok()
-                    .and_then(|dir| self.by_dir.get_mut(dir))
-                {
-                    rows_of_dir.push(DirRow { id, when: row.when });
-                }
-            }
-            at = at.saturating_add(run);
+        let ids = self.assign(&rows, &arena);
+        let mut touched = HashSet::new();
+        for (row, &id) in rows.iter().zip(&ids) {
+            self.record(row, id);
+            touched.insert(row.dir);
         }
-        self.merge(fresh);
+        self.settle(&touched);
         debug_assert_eq!(
             self.sorted.len(),
-            self.recent.len(),
-            "the two lists stay in step"
+            self.anchor.len(),
+            "the lists stay in step"
         );
-        self.refresh_local();
+        debug_assert_eq!(
+            self.sorted.len(),
+            self.pos.len(),
+            "every command has a place"
+        );
     }
 
-    /// The id of the command with this text, adding it if it is new, and its
-    /// last run brought up to `when`. Returns whether it was new.
-    fn id_for(&mut self, text: &str, when: i64) -> (u32, bool) {
-        let at = self.sorted.partition_point(|&id| self.text(id) < text);
-        if let Some(&id) = self.sorted.get(at)
-            && self.text(id) == text
-        {
-            if let Some(recent) = self.recent.get_mut(at) {
-                *recent = (*recent).max(when);
-            }
-            return (id, false);
+    /// The id of each row's command, new ones given ids and put in place.
+    fn assign(&mut self, rows: &[Pending], arena: &str) -> Vec<u32> {
+        let mut ids = Vec::with_capacity(rows.len());
+        let mut fresh: Vec<u32> = Vec::new();
+        let mut new_texts: HashMap<&str, u32> = HashMap::new();
+        for row in rows {
+            let text = slice(arena, row.text);
+            let at = self.sorted.partition_point(|&id| self.text(id) < text);
+            let known = self
+                .sorted
+                .get(at)
+                .copied()
+                .filter(|&id| self.text(id) == text);
+            let id = if let Some(id) = known.or_else(|| new_texts.get(text).copied()) {
+                id
+            } else {
+                {
+                    let id = u32::try_from(self.spans.len()).unwrap_or(u32::MAX);
+                    let start = u32::try_from(self.arena.len()).unwrap_or(u32::MAX);
+                    self.arena.push_str(text);
+                    self.spans.push(Span {
+                        start,
+                        len: row.text.len,
+                    });
+                    new_texts.insert(text, id);
+                    fresh.push(id);
+                    id
+                }
+            };
+            ids.push(id);
         }
-        let start = u32::try_from(self.arena.len()).unwrap_or(u32::MAX);
-        let len = u32::try_from(text.len()).unwrap_or(0);
-        let id = u32::try_from(self.spans.len()).unwrap_or(u32::MAX);
-        self.arena.push_str(text);
-        self.spans.push(Span { start, len });
-        (id, true)
+        self.merge(fresh);
+        ids
     }
 
-    /// Put the commands in `fresh` (which are in the arena but not in the
-    /// sorted list) into place.
-    fn merge(&mut self, mut fresh: Vec<(u32, i64)>) {
+    /// Put the commands in `fresh` (in the arena, not yet in the sorted
+    /// list) into place, with nothing known of their runs yet.
+    fn merge(&mut self, mut fresh: Vec<u32>) {
         if fresh.is_empty() {
             return;
         }
-        fresh.sort_by(|a, b| self.text(a.0).cmp(self.text(b.0)));
-        let mut sorted = Vec::with_capacity(self.sorted.len().saturating_add(fresh.len()));
-        let mut recent = Vec::with_capacity(sorted.capacity());
-        let mut old = self.sorted.iter().zip(self.recent.iter()).peekable();
+        fresh.sort_by(|a, b| self.text(*a).cmp(self.text(*b)));
+        let total = self.sorted.len().saturating_add(fresh.len());
+        let (mut sorted, mut last, mut anchor) = (
+            Vec::with_capacity(total),
+            Vec::with_capacity(total),
+            Vec::with_capacity(total),
+        );
+        let mut old = (0..self.sorted.len()).peekable();
         let mut new = fresh.iter().peekable();
-        loop {
-            let take_old = match (old.peek(), new.peek()) {
-                (Some((old_id, _)), Some((new_id, _))) => {
-                    self.text(**old_id).cmp(self.text(*new_id)) != Ordering::Greater
-                }
+        // Each turn takes one command from one of the two lists.
+        for _ in 0..total {
+            let old_id = old.peek().and_then(|&at| self.sorted.get(at)).copied();
+            let take_old = match (old_id, new.peek()) {
+                (Some(a), Some(b)) => self.text(a) <= self.text(**b),
                 (Some(_), None) => true,
                 (None, Some(_)) => false,
                 (None, None) => break,
             };
             if take_old {
-                if let Some((id, when)) = old.next() {
-                    sorted.push(*id);
-                    recent.push(*when);
-                }
-            } else if let Some((id, when)) = new.next() {
-                sorted.push(*id);
-                recent.push(*when);
+                let Some(at) = old.next() else { break };
+                sorted.push(self.sorted.get(at).copied().unwrap_or(0));
+                last.push(self.last.get(at).copied().unwrap_or(0));
+                anchor.push(self.anchor.get(at).copied().unwrap_or(NONE));
+            } else if let Some(&id) = new.next() {
+                sorted.push(id);
+                last.push(0);
+                anchor.push(NONE);
             }
         }
-        self.sorted = sorted;
-        self.recent = recent;
+        (self.sorted, self.last, self.anchor) = (sorted, last, anchor);
+        self.pos = vec![0; self.spans.len()];
+        for (at, &id) in self.sorted.iter().enumerate() {
+            if let Some(slot) = usize::try_from(id).ok().and_then(|id| self.pos.get_mut(id)) {
+                *slot = u32::try_from(at).unwrap_or(u32::MAX);
+            }
+        }
     }
 
-    /// The shell is now in `cwd`; commands run there come first.
-    pub fn set_cwd(&mut self, cwd: &str) {
+    /// Count one run of command `id` everywhere it counts.
+    fn record(&mut self, row: &Pending, id: u32) {
+        let weights = self.weights;
+        let ln_weight = if row.ok { 0.0 } else { weights.failed.ln() };
+        let term = worth::term(row.seq, ln_weight, weights.fade);
+        if let Some(at) = self.place(id) {
+            if let Some(anchor) = self.anchor.get_mut(at) {
+                *anchor = worth::log_add(*anchor, term);
+            }
+            if let Some(last) = self.last.get_mut(at) {
+                *last = (*last).max(row.seq);
+            }
+        }
+        self.mass = worth::log_add(self.mass, term);
+        let dir = usize::try_from(row.dir).ok();
+        if let Some(scope) = dir.and_then(|dir| self.dirs.get_mut(dir)) {
+            scope.add(id, row.seq, ln_weight, weights.fade_here);
+        }
+        let dir_name = dir.and_then(|dir| self.dir_names.get(dir));
+        if let (Some(project), Some(name)) = (&mut self.project, dir_name)
+            && under(name, &project.root)
+        {
+            project.scope.add(id, row.seq, ln_weight, weights.fade_here);
+        }
+        if let Some(&before) = self.session_last.get(&row.session) {
+            self.follows.entry(before).or_default().add(id);
+        }
+        self.session_last.insert(row.session, id);
+    }
+
+    /// Where command `id` is in the sorted list.
+    fn place(&self, id: u32) -> Option<usize> {
+        let at = self.pos.get(usize::try_from(id).ok()?)?;
+        usize::try_from(*at).ok()
+    }
+
+    /// Put the commands new to the directories in `touched`, and to the
+    /// project, into their places.
+    fn settle(&mut self, touched: &HashSet<u32>) {
+        let Self {
+            arena,
+            spans,
+            dirs,
+            project,
+            ..
+        } = self;
+        let text = |id: u32| text_of(arena, spans, id);
+        for &dir in touched {
+            if let Some(scope) = usize::try_from(dir).ok().and_then(|dir| dirs.get_mut(dir)) {
+                scope.settle(text);
+            }
+        }
+        if let Some(project) = project {
+            project.scope.settle(text);
+        }
+    }
+
+    /// The shell is now in `cwd`, in the project whose root is `root` if it
+    /// is in one.
+    pub fn set_context(&mut self, cwd: &str, root: Option<&str>) {
         cwd.clone_into(&mut self.cwd);
-        self.refresh_local();
-    }
-
-    /// Bring the view of the current directory up to date: built if the
-    /// directory changed or has gained commands, dropped if it has none.
-    fn refresh_local(&mut self) {
-        let Some(dir) = self.dir_ids.get(&self.cwd).copied() else {
-            self.local = Local::default();
-            return;
+        let same = match (&self.project, root) {
+            (Some(project), Some(root)) => project.root == root,
+            (None, None) => true,
+            _ => false,
         };
-        let Some(rows) = usize::try_from(dir).ok().and_then(|at| self.by_dir.get(at)) else {
-            return;
-        };
-        if self.local.dir == Some(dir) && self.local.built_from == rows.len() {
+        if same {
             return;
         }
-        let mut pairs: Vec<DirRow> = rows.clone();
-        let built_from = pairs.len();
-        pairs.sort_by(|a, b| {
-            self.text(a.id)
-                .cmp(self.text(b.id))
-                .then(b.when.cmp(&a.when))
-        });
-        pairs.dedup_by_key(|row| row.id);
-        self.local = Local {
-            dir: Some(dir),
-            built_from,
-            ids: pairs.iter().map(|row| row.id).collect(),
-            when: pairs.iter().map(|row| row.when).collect(),
-        };
+        self.project = root.map(|root| self.project_scope(root));
     }
 
-    /// The command to suggest for `line`: the most recent one that starts
-    /// with it and is longer, among those run in the current directory if
-    /// there are any, else among all.
+    /// The scope of the project at `root`: every directory under it.
+    fn project_scope(&self, root: &str) -> Project {
+        let mut scope = Scope::default();
+        for (name, &dir) in &self.dir_ids {
+            if !under(name, root) {
+                continue;
+            }
+            if let Some(theirs) = usize::try_from(dir).ok().and_then(|dir| self.dirs.get(dir)) {
+                scope.absorb(theirs);
+            }
+        }
+        scope.settle(|id| self.text(id));
+        Project {
+            root: root.to_owned(),
+            scope,
+        }
+    }
+
+    /// The command just run in this shell was `line`, if it is known.
+    pub fn set_prev(&mut self, line: Option<&str>) {
+        self.prev = line.and_then(|line| self.id_of(line));
+    }
+
+    /// Whether command `text` has been run (and committed).
     #[must_use]
-    pub fn suggest(&self, line: &str) -> Option<&str> {
-        if line.is_empty() {
-            return None;
-        }
-        self.best(&self.local.ids, &self.local.when, line)
-            .or_else(|| self.best(&self.sorted, &self.recent, line))
+    pub fn knows(&self, text: &str) -> bool {
+        self.id_of(text).is_some()
     }
 
-    fn best(&self, ids: &[u32], when: &[i64], line: &str) -> Option<&str> {
-        let low = ids.partition_point(|&id| self.text(id) < line);
-        let tail = ids.get(low..)?;
-        let run = tail.partition_point(|&id| self.text(id).starts_with(line));
+    fn id_of(&self, text: &str) -> Option<u32> {
+        let at = self.sorted.partition_point(|&id| self.text(id) < text);
+        self.sorted
+            .get(at)
+            .copied()
+            .filter(|&id| self.text(id) == text)
+    }
+
+    fn here(&self) -> Option<&Scope> {
+        let dir = self.dir_ids.get(&self.cwd)?;
+        self.dirs.get(usize::try_from(*dir).ok()?)
+    }
+
+    /// The chance that command `id` is the one meant, as [`rank`] has it.
+    fn score(&self, id: u32) -> f64 {
+        let w = &self.weights;
+        let everywhere = self
+            .place(id)
+            .and_then(|at| self.anchor.get(at))
+            .map_or(0.0, |&anchor| worth::share(anchor, self.mass));
+        let project = self.project.as_ref().map_or(0.0, |p| p.scope.share(id));
+        let directory = self.here().map_or(0.0, |scope| scope.share(id));
+        let follows = self
+            .prev
+            .and_then(|prev| self.follows.get(&prev))
+            .map_or(0.0, |follows| follows.share(id));
+        w.everywhere * everywhere
+            + w.project * project
+            + w.directory * directory
+            + w.follows * follows
+    }
+
+    /// The commands that start with `line` and are longer, in the sorted
+    /// list: from, to.
+    fn run(&self, line: &str) -> (usize, usize) {
+        let low = self.sorted.partition_point(|&id| self.text(id) < line);
+        let tail = self.sorted.get(low..).unwrap_or_default();
+        let len = tail.partition_point(|&id| self.text(id).starts_with(line));
         let mut from = low;
         // The command that is exactly what was typed has nothing to add.
-        if run > 0 && ids.get(low).is_some_and(|&id| self.text(id) == line) {
+        if len > 0 && tail.first().is_some_and(|&id| self.text(id) == line) {
             from = from.saturating_add(1);
         }
-        let end = low.saturating_add(run);
-        debug_assert!(
-            from <= end && end <= ids.len(),
-            "the run is inside the list"
-        );
-        let stretch = when.get(from..end)?;
-        let (offset, _) = stretch.iter().enumerate().max_by_key(|&(_, when)| *when)?;
-        let id = *ids.get(from.saturating_add(offset))?;
-        Some(self.text(id))
+        (from, low.saturating_add(len))
     }
-}
 
-fn slice(arena: &str, span: Span) -> &str {
-    let start = usize::try_from(span.start).unwrap_or(0);
-    let end = start.saturating_add(usize::try_from(span.len).unwrap_or(0));
-    arena.get(start..end).unwrap_or_default()
+    /// The best few commands that start with `line` and are longer, in
+    /// `order`, best first.
+    #[must_use]
+    pub fn ranked(&self, line: &str, order: Order) -> Best {
+        if line.is_empty() {
+            return Best::default();
+        }
+        match order {
+            Order::Likely => self.likely(line),
+            Order::Recent => self.recent(line, false),
+            Order::RecentHereFirst => self.recent(line, true),
+        }
+    }
+
+    fn likely(&self, line: &str) -> Best {
+        let (from, to) = self.run(line);
+        // The whole history's best by worth alone: any command that no
+        // other estimate knows scores by that, so one of these, or one the
+        // others know, is the best of all.
+        let mut worthiest = Best::default();
+        let stretch = self.anchor.get(from..to).unwrap_or_default();
+        for (offset, &anchor) in stretch.iter().enumerate().take(MAX_SCAN) {
+            let at = from.saturating_add(offset);
+            if let Some(&id) = self.sorted.get(at) {
+                worthiest.offer(id, anchor);
+            }
+        }
+        let mut best = Best::default();
+        for id in worthiest.ids() {
+            best.offer(id, self.score(id));
+        }
+        let text = |id: u32| self.text(id);
+        let scopes = [self.here(), self.project.as_ref().map(|p| &p.scope)];
+        for scope in scopes.into_iter().flatten() {
+            for &id in scope.starting(line, text).iter().take(MAX_LOCAL) {
+                if self.text(id) != line {
+                    best.offer(id, self.score(id));
+                }
+            }
+        }
+        let follows = self.prev.and_then(|prev| self.follows.get(&prev));
+        for &(id, _) in follows.map(|f| f.next.as_slice()).unwrap_or_default() {
+            let fits = self.text(id);
+            if fits.starts_with(line) && fits != line {
+                best.offer(id, self.score(id));
+            }
+        }
+        best
+    }
+
+    fn recent(&self, line: &str, here_first: bool) -> Best {
+        let mut best = Best::default();
+        if here_first && let Some(scope) = self.here() {
+            let text = |id: u32| self.text(id);
+            for &id in scope.starting(line, text).iter().take(MAX_LOCAL) {
+                if let (true, Some(stat)) = (self.text(id) != line, scope.stat(id)) {
+                    best.offer(id, f64::from(stat.last));
+                }
+            }
+            if !best.is_empty() {
+                return best;
+            }
+        }
+        let (from, to) = self.run(line);
+        let stretch = self.last.get(from..to).unwrap_or_default();
+        for (offset, &last) in stretch.iter().enumerate().take(MAX_SCAN) {
+            if let Some(&id) = self.sorted.get(from.saturating_add(offset)) {
+                best.offer(id, f64::from(last));
+            }
+        }
+        best
+    }
+
+    /// The text of command `id`.
+    #[must_use]
+    pub fn command(&self, id: u32) -> &str {
+        self.text(id)
+    }
+
+    /// The command to suggest for `line`: the likeliest that starts with it
+    /// and is longer.
+    #[must_use]
+    pub fn suggest(&self, line: &str) -> Option<&str> {
+        self.ranked(line, Order::Likely)
+            .first()
+            .map(|id| self.text(id))
+    }
+
+    /// What a program's name is worth as the first word of a line: the share
+    /// of the whole history held by the command that is just the name and by
+    /// those that start with it and a blank.
+    #[must_use]
+    pub fn word_worth(&self, word: &str) -> f64 {
+        let exact = self.id_of(word).and_then(|id| self.place(id));
+        let (from, to) = self.run(&format!("{word} "));
+        let mut total = 0.0;
+        for at in (from..to).take(MAX_SCAN).chain(exact) {
+            if let Some(&anchor) = self.anchor.get(at) {
+                total += worth::share(anchor, self.mass);
+            }
+        }
+        total
+    }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn index(history: &[(&str, &str, i64)]) -> Index {
-        let mut index = Index::new();
-        for &(command, cwd, when) in history {
-            index.push(command, cwd, when).unwrap();
-        }
-        index.commit();
-        index
-    }
-
-    #[test]
-    fn the_most_recent_command_with_the_prefix_wins() {
-        let index = index(&[
-            ("git status", "/a", 1),
-            ("git stash", "/a", 3),
-            ("git switch main", "/a", 2),
-        ]);
-        assert_eq!(index.suggest("git s"), Some("git stash"));
-        assert_eq!(index.suggest("git sw"), Some("git switch main"));
-        assert_eq!(index.suggest("git sta"), Some("git stash"));
-    }
-
-    #[test]
-    fn nothing_matches_nothing() {
-        let index = index(&[("git status", "/a", 1)]);
-        assert_eq!(index.suggest("ls"), None);
-        assert_eq!(index.suggest("git status -sb"), None);
-    }
-
-    #[test]
-    fn an_empty_line_is_never_suggested_for() {
-        let index = index(&[("ls", "/a", 1)]);
-        assert_eq!(index.suggest(""), None);
-    }
-
-    #[test]
-    fn a_command_exactly_as_typed_has_nothing_to_add() {
-        let index = index(&[("make", "/a", 1)]);
-        assert_eq!(index.suggest("make"), None);
-        let index = self::index(&[("make", "/a", 5), ("make test", "/a", 1)]);
-        assert_eq!(index.suggest("make"), Some("make test"));
-    }
-
-    #[test]
-    fn a_repeated_command_counts_by_its_last_run() {
-        let index = index(&[
-            ("cargo build", "/a", 1),
-            ("cargo test", "/a", 2),
-            ("cargo build", "/a", 3),
-        ]);
-        assert_eq!(index.suggest("cargo "), Some("cargo build"));
-        assert_eq!(index.len(), 2);
-        assert_eq!(index.rows(), 3);
-    }
-
-    #[test]
-    fn commands_run_in_this_directory_come_first() {
-        let mut index = index(&[
-            ("make here", "/work/here", 1),
-            ("make elsewhere", "/work/other", 9),
-        ]);
-        assert_eq!(index.suggest("make "), Some("make elsewhere"));
-        index.set_cwd("/work/here");
-        assert_eq!(index.suggest("make "), Some("make here"));
-        index.set_cwd("/work/other");
-        assert_eq!(index.suggest("make "), Some("make elsewhere"));
-    }
-
-    #[test]
-    fn with_nothing_here_it_falls_back_to_everything() {
-        let mut index = index(&[("make here", "/work/here", 1), ("ls -la", "/work/other", 9)]);
-        index.set_cwd("/work/here");
-        assert_eq!(index.suggest("ls"), Some("ls -la"));
-        index.set_cwd("/nowhere");
-        assert_eq!(index.suggest("make"), Some("make here"));
-    }
-
-    #[test]
-    fn within_this_directory_the_most_recent_wins() {
-        let mut index = index(&[
-            ("git add a", "/p", 1),
-            ("git add b", "/p", 7),
-            ("git add c", "/q", 9),
-        ]);
-        index.set_cwd("/p");
-        assert_eq!(index.suggest("git add"), Some("git add b"));
-    }
-
-    #[test]
-    fn later_commits_are_merged_and_seen() {
-        let mut index = index(&[("echo a", "/a", 1), ("echo c", "/a", 3)]);
-        index.set_cwd("/a");
-        index.push("echo b", "/a", 4).unwrap();
-        index.push("ls", "/b", 5).unwrap();
-        assert_eq!(index.suggest("echo "), Some("echo c"));
-        index.commit();
-        assert_eq!(index.suggest("echo "), Some("echo b"));
-        assert_eq!(index.suggest("l"), Some("ls"));
-        assert_eq!(index.len(), 4);
-    }
-
-    #[test]
-    fn a_repeat_in_a_later_commit_moves_the_command_forward() {
-        let mut index = index(&[("echo a", "/a", 1), ("echo b", "/a", 2)]);
-        assert_eq!(index.suggest("echo "), Some("echo b"));
-        index.push("echo a", "/a", 3).unwrap();
-        index.commit();
-        assert_eq!(index.suggest("echo "), Some("echo a"));
-        assert_eq!(index.len(), 2);
-    }
-
-    #[test]
-    fn a_directory_view_is_rebuilt_when_it_gains_a_command() {
-        let mut index = index(&[("make one", "/p", 1), ("make two", "/q", 5)]);
-        index.set_cwd("/p");
-        index.push("make three", "/p", 6).unwrap();
-        index.commit();
-        assert_eq!(index.suggest("make "), Some("make three"));
-    }
-
-    #[test]
-    fn commands_that_cannot_be_typed_are_refused() {
-        let mut index = Index::new();
-        assert_eq!(index.push("", "/", 1), Err(Refused::NotText));
-        assert_eq!(index.push("a\nb", "/", 1), Err(Refused::NotText));
-        assert_eq!(index.push("a\tb", "/", 1), Err(Refused::NotText));
-        assert_eq!(index.push(" secret", "/", 1), Err(Refused::Hidden));
-        assert_eq!(index.push(&"x".repeat(5000), "/", 1), Err(Refused::TooLong));
-        assert_eq!(index.push("fine", "/", 1), Ok(()));
-    }
-
-    #[test]
-    fn prefixes_with_multibyte_text_work() {
-        let index = index(&[("echo \u{65e5}\u{672c}", "/a", 1)]);
-        assert_eq!(
-            index.suggest("echo \u{65e5}"),
-            Some("echo \u{65e5}\u{672c}")
-        );
-    }
-
-    #[test]
-    fn a_prefix_that_is_a_prefix_of_nothing_is_none_even_between_commands() {
-        let index = index(&[("aa", "/", 1), ("cc", "/", 2)]);
-        assert_eq!(index.suggest("b"), None);
-    }
-
-    #[test]
-    fn clear_forgets_everything() {
-        let mut index = index(&[("ls -la", "/", 1)]);
-        index.clear();
-        assert!(index.is_empty());
-        assert_eq!(index.suggest("ls"), None);
-    }
-
-    #[test]
-    fn a_lookup_in_a_large_history_is_fast() {
-        let mut index = Index::new();
-        for n in 0..100_000_i64 {
-            index
-                .push(&format!("cmd{} --flag {}", n % 30_000, n), "/d", n)
-                .unwrap();
-        }
-        index.commit();
-        let started = std::time::Instant::now();
-        for n in 0..1000 {
-            let _ = index.suggest(&format!("cmd{}", n % 100));
-        }
-        let each = started.elapsed() / 1000;
-        assert!(
-            each < std::time::Duration::from_millis(2),
-            "{each:?} a lookup"
-        );
-    }
-}
+mod tests;
