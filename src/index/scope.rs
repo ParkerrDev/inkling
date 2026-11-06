@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 
 use super::worth::{self, NONE};
+use crate::text;
 
 /// A command in a scope.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -18,7 +19,7 @@ pub struct Stat {
 /// The commands of one scope.
 #[derive(Debug)]
 pub struct Scope {
-    /// The ids, ordered by their text.
+    /// The ids, in the order of their text (see [`text::key_cmp`]).
     ids: Vec<u32>,
     stats: HashMap<u32, Stat>,
     /// Ids taken in since the last [`Scope::settle`], not yet in `ids`.
@@ -63,13 +64,13 @@ impl Scope {
             return;
         }
         let mut fresh = std::mem::take(&mut self.fresh);
-        fresh.sort_by(|a, b| text(*a).cmp(text(*b)));
+        fresh.sort_by(|a, b| text::key_cmp(text(*a), text(*b)));
         let mut merged = Vec::with_capacity(self.ids.len().saturating_add(fresh.len()));
         let (mut old, mut new) = (self.ids.iter().peekable(), fresh.iter().peekable());
         // Each turn takes one id from one of the two lists.
         for _ in 0..merged.capacity() {
             let take_old = match (old.peek(), new.peek()) {
-                (Some(a), Some(b)) => text(**a) <= text(**b),
+                (Some(a), Some(b)) => text::key_cmp(text(**a), text(**b)).is_le(),
                 (Some(_), None) => true,
                 (None, Some(_)) => false,
                 (None, None) => break,
@@ -82,11 +83,13 @@ impl Scope {
         self.ids = merged;
     }
 
-    /// The ids whose text starts with `prefix`, ordered by text.
+    /// The ids whose text starts with `prefix`, case aside, in order.
     pub fn starting<'a>(&self, prefix: &str, text: impl Fn(u32) -> &'a str) -> &[u32] {
-        let low = self.ids.partition_point(|&id| text(id) < prefix);
+        let low = self
+            .ids
+            .partition_point(|&id| text::fold_cmp(text(id), prefix).is_lt());
         let tail = self.ids.get(low..).unwrap_or_default();
-        let run = tail.partition_point(|&id| text(id).starts_with(prefix));
+        let run = tail.partition_point(|&id| text::starts_folded(text(id), prefix));
         tail.get(..run).unwrap_or_default()
     }
 
@@ -127,7 +130,7 @@ impl Scope {
 mod tests {
     use super::*;
 
-    const TEXTS: &[&str] = &["git add", "git status", "ls", "make"];
+    const TEXTS: &[&str] = &["git add", "git status", "ls", "make", "Git log"];
 
     fn text(id: u32) -> &'static str {
         TEXTS[usize::try_from(id).unwrap()]
@@ -149,6 +152,18 @@ mod tests {
         assert_eq!(scope.starting("x", text), &[] as &[u32]);
         assert_eq!(scope.stat(1).map(|s| (s.runs, s.last)), Some((2, 4)));
         assert_eq!(scope.starting("", text).len(), 3);
+    }
+
+    #[test]
+    fn a_prefix_finds_its_commands_in_any_case() {
+        let mut scope = Scope::default();
+        for (id, seq) in [(1, 1), (4, 2), (0, 3), (3, 4)] {
+            scope.add(id, seq, 0.0, 10.0);
+        }
+        scope.settle(text);
+        assert_eq!(scope.starting("git", text), &[0, 4, 1]);
+        assert_eq!(scope.starting("GIT L", text), &[4]);
+        assert_eq!(scope.starting("M", text), &[3]);
     }
 
     #[test]

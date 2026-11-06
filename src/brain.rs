@@ -140,8 +140,8 @@ impl Suggest for Brain {
             return Some(Cow::Borrowed(command));
         }
         let mut look = self.look.try_borrow_mut().ok()?;
-        let rest = look.finish(line, &|word| self.index.word_worth(word))?;
-        Some(Cow::Owned(format!("{line}{rest}")))
+        let finished = look.finish(line, &|word| self.index.word_worth(word))?;
+        Some(Cow::Owned(finished))
     }
 }
 

@@ -5,6 +5,7 @@ use super::{
     Prompt, REPORT_TIMEOUT, SETTLE, SETTLE_LIMIT, Suggest, Tty, quote, render,
 };
 use crate::keys::{self, Token};
+use crate::text::Fix;
 
 /// `at` and `by` added, or `at` if the sum does not exist.
 pub(super) fn after(at: Instant, by: Duration) -> Instant {
@@ -248,7 +249,7 @@ impl<S: Suggest> Engine<S> {
 
     /// What to suggest for the line as it stands: the whole rest of the
     /// command, and as much of it as fits on the row.
-    fn choose(&self) -> Option<(String, String)> {
+    fn choose(&self) -> Option<(Fix, String)> {
         let Phase::Prompt(prompt) = &self.phase else {
             return None;
         };

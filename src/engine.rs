@@ -30,7 +30,9 @@
 //!   so the shell's drawing lands where it expects and corrects anything that
 //!   was guessed wrong.
 //! * A key that takes the suggestion is not sent; the missing characters are,
-//!   as if typed.
+//!   as if typed. Where the line has a letter in lower case that the command
+//!   has in upper case, the characters from the first such letter on are
+//!   deleted first, with Backspace, and typed again as the command has them.
 //! * A probe is never sent when it might reach anything but readline: after
 //!   a key that is not known to leave the shell plain, while another program
 //!   holds the terminal, inside a paste, or in the same write as a key that
@@ -66,9 +68,10 @@ const PASTE_END: &[u8] = b"\x1b[201~";
 
 /// Where suggestions come from.
 pub trait Suggest {
-    /// The command to suggest for `line`: one that starts with it and is
-    /// longer. Taken from the history as it is, or made (a file's name
-    /// finished).
+    /// The command to suggest for `line`: one that starts with it, as
+    /// [`text::start`] has it (a letter typed in lower case fits either
+    /// case), and is longer. Taken from the history as it is, or made (a
+    /// file's name finished).
     fn suggest(&self, line: &str) -> Option<Cow<'_, str>>;
 }
 
@@ -334,8 +337,8 @@ struct Batch {
 
 /// What the keys in a pass may use.
 struct Ctx<'a> {
-    /// The rest of the suggestion on screen, if there is one.
-    shown: Option<&'a str>,
+    /// The suggestion on screen, if there is one.
+    shown: Option<&'a text::Fix>,
 }
 
 /// How the keys of a pass go on.
@@ -360,8 +363,9 @@ pub struct Engine<S> {
     found: Vec<osc::Found>,
     /// The shell's output kept back while a probe is out.
     held: Vec<u8>,
-    /// The part of a suggestion that is on screen, whole.
-    shown: Option<String>,
+    /// The suggestion that is on screen, whole: the rest of the command,
+    /// and what puts the case of the line right.
+    shown: Option<text::Fix>,
     /// When output last ended inside the start of a mark.
     mark_since: Option<Instant>,
     /// A probe was given up on for lack of room, and the keys that waited
@@ -477,17 +481,18 @@ impl<S: Suggest> Engine<S> {
     }
 
     /// The suggestion for `text` with `room` columns to draw it in: the whole
-    /// rest of the command, and as much of it as fits.
-    fn suggestion_for(&self, text: &str, room: usize) -> Option<(String, String)> {
+    /// of it, and as much of its rest as fits. Only the rest is drawn; the
+    /// line keeps the case it was typed in until the suggestion is taken.
+    fn suggestion_for(&self, text: &str, room: usize) -> Option<(text::Fix, String)> {
         // Never for an empty line, and not for one that is more than a row
         // of plain text.
         if text.is_empty() || text.chars().any(char::is_control) {
             return None;
         }
         let command = self.suggester.suggest(text)?;
-        let rest = command.strip_prefix(text)?;
-        let visible = text::fit(rest, room)?;
-        Some((rest.to_owned(), visible))
+        let fix = text::fix(text, &command).filter(|fix| !fix.rest.is_empty())?;
+        let visible = text::fit(&fix.rest, room)?;
+        Some((fix, visible))
     }
 
     /// Draw what the keys just passed will do, and the suggestion for the

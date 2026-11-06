@@ -314,3 +314,108 @@ fn a_lookup_in_a_large_history_is_fast() {
         "{each:?} a lookup"
     );
 }
+
+#[test]
+fn a_line_in_lower_case_finds_the_command_with_capitals() {
+    let index = index(&[("cd ~/Dev/GitHub", "/a")], "/a");
+    assert_eq!(index.suggest("cd ~/dev"), Some("cd ~/Dev/GitHub"));
+    assert_eq!(index.suggest("cd ~/D"), Some("cd ~/Dev/GitHub"));
+    assert_eq!(index.suggest("cd ~/Dev/g"), Some("cd ~/Dev/GitHub"));
+    assert_eq!(index.suggest("cd ~/DEV"), None, "a capital typed is meant");
+    assert_eq!(index.suggest("CD"), None);
+    assert_eq!(index.suggest("cd ~/dev/github"), None, "nothing to add");
+}
+
+#[test]
+fn a_command_as_typed_comes_before_one_that_fits_but_for_case() {
+    // The one with the capital is a little more recent; the one as typed
+    // still wins, and a capital typed finds only its own.
+    let index = index(&[("make test", "/a"), ("make Test", "/a")], "/z");
+    assert_eq!(index.suggest("make t"), Some("make test"));
+    assert_eq!(index.suggest("make T"), Some("make Test"));
+    let best: Vec<&str> = index
+        .ranked("make t", Order::Likely)
+        .ids()
+        .map(|id| index.command(id))
+        .collect();
+    assert_eq!(best, ["make test", "make Test"]);
+}
+
+#[test]
+fn but_one_run_far_more_often_wins_though_it_fits_only_but_for_case() {
+    let mut history = vec![("cd ~/dev-old", "/a")];
+    history.extend([("cd ~/Dev/GitHub", "/a"); 6]);
+    let index = index(&history, "/z");
+    assert_eq!(index.suggest("cd ~/d"), Some("cd ~/Dev/GitHub"));
+}
+
+#[test]
+fn capitals_past_the_first_characters_are_judged_from_the_text() {
+    let pad = "a".repeat(text::CAPITALS);
+    let capital = format!("echo {pad}Tail");
+    let lower = format!("echo {pad}tail");
+    let index = self::index(&[(capital.as_str(), "/a")], "/a");
+    assert_eq!(
+        index.suggest(&format!("echo {pad}t")),
+        Some(capital.as_str())
+    );
+    let index = self::index(&[(lower.as_str(), "/a")], "/a");
+    assert_eq!(index.suggest(&format!("echo {pad}T")), None);
+    assert_eq!(index.suggest(&format!("echo {pad}t")), Some(lower.as_str()));
+}
+
+#[test]
+fn fish_takes_the_case_as_typed_first_and_any_case_only_when_nothing_else_fits() {
+    let index = index(&[("ls music-old", "/a"), ("ls Music", "/a")], "/a");
+    let top = |line: &str, order: Order| {
+        index
+            .ranked(line, order)
+            .first()
+            .map(|id| index.command(id).to_owned())
+    };
+    assert_eq!(top("ls m", Order::Recent).as_deref(), Some("ls music-old"));
+    assert_eq!(top("ls M", Order::Recent).as_deref(), Some("ls Music"));
+    assert_eq!(top("ls mU", Order::Recent).as_deref(), Some("ls Music"));
+    assert_eq!(top("ls mU", Order::Likely), None, "a capital typed is kept");
+    let index = self::index(&[("ls music", "/a")], "/a");
+    let top = |line: &str, order: Order| {
+        index
+            .ranked(line, order)
+            .first()
+            .map(|id| index.command(id).to_owned())
+    };
+    assert_eq!(top("ls M", Order::Recent).as_deref(), Some("ls music"));
+    assert_eq!(top("ls M", Order::RecentHereFirst), None, "inkling before");
+    assert_eq!(top("ls M", Order::Likely), None);
+}
+
+#[test]
+fn a_programs_name_is_worth_only_what_its_own_case_is() {
+    let index = index(&[("Make all", "/a"), ("make", "/a")], "/a");
+    assert!(index.word_worth("make") > 0.0);
+    assert!(index.word_worth("Make") > 0.0);
+    let only = self::index(&[("Make all", "/a")], "/a");
+    assert!(only.word_worth("make").abs() < f64::EPSILON);
+}
+
+#[test]
+fn a_capital_typed_first_in_a_large_history_is_still_fast() {
+    // Every command starts with the folded "c", and none with "C": the
+    // whole run is judged, by its capitals, without its text.
+    let mut index = Index::new();
+    for n in 0..100_000_u32 {
+        let command = format!("cmd{} --flag {}", n % 30_000, n);
+        index.push(&run(&command, "/elsewhere")).unwrap();
+    }
+    index.commit();
+    index.set_context("/d7", None);
+    let started = std::time::Instant::now();
+    for _ in 0..100 {
+        assert_eq!(index.suggest("C"), None);
+    }
+    let each = started.elapsed() / 100;
+    assert!(
+        each < std::time::Duration::from_millis(2),
+        "{each:?} a lookup"
+    );
+}

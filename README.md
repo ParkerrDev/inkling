@@ -8,6 +8,7 @@ type just types.
 ```
 $ git sta                       you type "git sta"
 $ git sta|tus -sb               the dim rest of the "git status -sb" you most likely mean
+$ cd ~/dev/g|itHub              "cd ~/Dev/GitHub": taking it puts the case right
 ```
 
 It exists because the usual way to get this in bash, ble.sh, replaces readline
@@ -25,7 +26,13 @@ from what you run in this directory, in this project and after the command you
 just ran, among those whose paths are there; with nothing in the history, a
 program's or a file's name is finished instead. On its owner's own history,
 replayed, the very command is suggested after one character 64% of the time,
-against 53% for fish's rule. See Measurements.
+against 52% for fish's rule.
+
+And case is no bother. A letter typed in lower case fits a command that has it
+in upper case, and taking the suggestion puts the case of the line right; a
+capital typed is kept. Typed all in lower case, the replay still has the very
+command after one character 63% of the time, and saves more typing than fish
+does for someone who types every capital. See Measurements.
 
 ## Install
 
@@ -55,10 +62,10 @@ comes up with a shell in it.
 
 `inkling replay` replays your history and says how much typing the
 suggestions would have saved you, and how often they were the very command,
-next to fish's order and inkling's earlier one. It prints numbers only, never
-a command. `inkling replay --tune` also searches for the weights (see below)
-that would have done best on the older part of your history, and judges them
-on the newer part.
+next to fish's rule and inkling's first one, typed in its own case and in lower
+case. It prints numbers only, never a command. `inkling replay --tune` also
+searches for the weights (see below) that would have done best on the older
+part of your history, and judges them on the newer part.
 
 `INKLING=0 bash` starts a shell without it, for one session. Set `INKLING=0`
 in the environment to turn it off for everything started from there.
@@ -78,7 +85,10 @@ in both directions, to that file, for finding out why something went as it did.
 
 With nothing showing, or the cursor inside the line, these keys do what they
 always did. The missing characters are sent to the shell as if you had typed
-them.
+them. Where the line has a letter in lower case that the command has in upper
+case, they are sent after as many deletes as take the line back to that letter
+and the command's own text from there, so the line becomes the command as it
+is in the history: `cd ~/dev/g` and Right make `cd ~/Dev/GitHub`.
 
 A suggestion is never made for an empty line, for a command that is exactly
 what you typed, for a command with a control character in it (a newline or a
@@ -138,15 +148,32 @@ column is followed from the last carriage return of a command's output, so the
 first key of a command is drawn ahead too. Nothing is drawn ahead that would
 reach the end of the row, and automatic wrapping is off while it is.
 
-**History.** From Atuin's database (`~/.local/share/atuin/history.db`, opened
-read-only, `query_only` on) if it is there, else `$HISTFILE`. The commands are
+**History.** From Atuin's database if it is there, else `$HISTFILE`. The
+database is looked for where Atuin 18 keeps it: `ATUIN_DB_PATH`, else
+`$ATUIN_HOME/data`, else `~/.atuin/data` if that is there, else
+`$XDG_DATA_HOME/atuin` or `~/.local/share/atuin` (where Atuin kept it before)
+if that is there; it is opened read-only, `query_only` on. The commands are
 read into memory on a thread of their own when the session starts, so the
 shell's first prompt waits for nothing, and what is new is read at each
-prompt. Every distinct command is kept once in a list sorted by its text: the
-commands that start with what you typed are one run of that list, found by two
-binary searches. Each directory has a list of the same kind for what was run
-there, and the project the shell is in (the tree under the nearest directory
-with a `.git`, `.hg` or `.jj`) gets one made from the directories under it.
+prompt. Every distinct command is kept once in a list sorted by its text, case
+aside: the commands that start with what you typed, in any case, are one run
+of that list, found by two binary searches. Each directory has a list of the
+same kind for what was run there, and the project the shell is in (the tree
+under the nearest directory with a `.git`, `.hg` or `.jj`) gets one made from
+the directories under it.
+
+**Case.** A letter typed in lower case fits a command that has it in either
+case; one typed in upper case fits only itself. So `cd ~/dev/g` fits
+`cd ~/Dev/GitHub`, and `cd ~/D` does not fit `cd ~/dotfiles`: a capital is
+rarely typed by accident, and a lower case letter often is, by anyone who does
+not reach for Shift. Beside each command are the capitals among its first 64
+characters, one bit each, so most of a run is judged for case without reading
+its text. A command that fits only with letters taken for capitals counts for
+a quarter of what it would if it fitted as typed (see the replay under
+Measurements), so the command in the case you typed comes first unless
+the other is run far more often. fish minds case less carefully: it takes the
+most recent command that starts with the line as typed and, when there is
+none, the most recent in any case, a capital typed or not.
 
 **Which command.** Of the commands that start with the line, the one suggested
 is the likeliest to be meant, as a mixture of four estimates, each a share
@@ -187,9 +214,11 @@ much as all the names that fit share; elsewhere with the name of a file or
 directory in the directory the word points into (a slash after a directory, a
 backslash before a character bash would take for something else), as much as
 the names that fit share, or the one changed last. `cd` is only finished with
-directories, and hidden names only when the word starts with a dot. The
-directory's names and the programs are read while the prompt is drawn, so no
-key waits for them.
+directories, and hidden names only when the word starts with a dot. Names fit
+in any case as commands do, those that fit as typed first, and a directory
+typed in the wrong case on the way is put in its own: `cd ~/dev/gith` finishes
+as `cd ~/Dev/GitHub/`. The directory's names and the programs are read while
+the prompt is drawn, so no key waits for them.
 
 ## When a probe is sent
 
@@ -240,7 +269,7 @@ one key at a time at a fresh prompt, towards the oldest command in the history,
 "git status --short --branch", twenty times over; the four take turns key by
 key, so that whatever else the machine does weighs on them all alike. A key is
 done when the row shows what was typed, the cursor after it, and the rest of
-the command after the cursor. Microseconds from the key:
+the command after the cursor. Microseconds from the key, measured with 0.2:
 
 | 100,001 commands in the history | echo, median | suggestion, median | suggestion, 95th percentile | worst |
 | --- | ---: | ---: | ---: | ---: |
@@ -252,14 +281,21 @@ the command after the cursor. Microseconds from the key:
 With 1,001 commands the medians are 261 (bash), 333 (inkling), 379 (fish) and
 4,909 (ble.sh), and the suggestion's 95th percentiles 932, 1,217 and 32,359.
 
+Raced again for 0.3, back to back with 0.2 (fish and ble.sh were not
+installed for that run), each added 18 to 32 microseconds to bash's echo at the
+median, with 1,001 commands or 100,001: the matching in any case does not show.
+
 So inkling's key and its suggestion reach the screen together, with bash's own
 echo: what is left in those numbers is the kernel's pseudo-terminal and the
 waking of a process, which no line editor gets under. fish's echo is about as
 quick, but with a long history its suggestion comes tens of milliseconds later
 whenever the match is an old command; ble.sh is slower on every key. Inside
 inkling, finding the suggestion (the ranking, the path checks, the names) took
-1.6 microseconds at the median, 12 at the 99th percentile and 43 at worst over
-20,000 keys of its owner's own history.
+1.5 microseconds at the median, 16 at the 99th percentile and about 100 at
+worst (a directory's paths looked at for the first time) over 20,000 keys of
+its owner's own history, typed in its own case or in lower case alike. 0.2,
+which minded case, took 0.95, 19 and about 100 on the same keys. Texts are
+compared case aside eight bytes at a time.
 
 `scripts/measure` times the rest: from a key to the first byte back, inkling
 adds 0 to 70 microseconds at the median to plain bash (it added 300 to 500
@@ -275,22 +311,42 @@ small history file, 9 MiB with 10,000 runs in Atuin, 31 MiB with 100,000 (peak
 38 MiB while loading), and about 90 MiB with 400,000 that are nearly all
 different. The program is 2.4 MB.
 
-**The replay** (`inkling replay`), on its owner's own Atuin history: 62,982
+**The replay** (`inkling replay`), on its owner's own Atuin history: 63,242
 commands from several machines over the years. The first 70% are learned and
 the last 30% typed, each command after the ones before it, as described under
-`inkling replay`: 18,736 commands, 210,375 characters.
+`inkling replay`: 18,814 commands, 211,090 characters. They are typed twice:
+with every letter in its own case, and all in lower case, by someone who
+leaves the case to the suggestion. fish's rule is fish's own: the most recent
+command that starts with the line as typed, else the most recent in any case.
+
+Typed with every letter in its own case:
 
 | | typing saved | the very command after 1 character | 2 | 3 |
 | --- | ---: | ---: | ---: | ---: |
-| fish's order (the most recent) | 51.7% | 52.5% | 58.2% | 58.8% |
-| inkling before (the most recent, this directory first) | 52.6% | 54.1% | 62.0% | 62.8% |
-| inkling (the likeliest, as above) | 53.4% | 64.0% | 64.4% | 65.0% |
-| knowing every command run before, and nothing of new ones | 50.9% | 87.3% | 83.4% | 83.3% |
+| fish's rule (the most recent; as typed, else in any case) | 51.6% | 52.4% | 58.0% | 58.7% |
+| inkling's first rule (the most recent, this directory first) | 52.5% | 53.9% | 61.9% | 62.6% |
+| inkling (the likeliest, as above; 0.2 is the same) | 53.2% | 63.8% | 64.2% | 64.9% |
+| knowing every command run before, and nothing of new ones | 50.8% | 87.3% | 83.3% | 83.2% |
+
+Typed all in lower case:
+
+| | typing saved | the very command after 1 character | 2 | 3 |
+| --- | ---: | ---: | ---: | ---: |
+| fish's rule | 50.4% | 51.9% | 57.2% | 57.9% |
+| inkling's first rule (minding case) | 45.4% | 53.5% | 61.0% | 61.7% |
+| inkling 0.2 (the likeliest, minding case) | 45.8% | 63.4% | 63.4% | 64.0% |
+| inkling | 52.8% | 63.4% | 63.7% | 64.7% |
+
+Typed in lower case, inkling saves more than fish does for someone who types
+every capital. The weight of a command that fits only but for case, a quarter,
+is in the middle of those that save the most in lower case and cost nothing in
+its own case: from 0.15 to 0.35 the replay is the same to a tenth of a percent,
+and from a half up it types a tenth of a percent less in its own case.
 
 The last row is a bound, not a rival: a suggester that always knows the command
 when it has been run before. It types less of the commands it has seen than any
 order can, and nothing of new ones, where inkling's suggestion of a similar
-command still gives its first words. The history was read in 28 ms.
+command still gives its first words. The history was read in 38 ms.
 
 ## What it changes in your shell
 

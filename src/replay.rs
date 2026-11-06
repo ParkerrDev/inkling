@@ -10,6 +10,13 @@
 //! one, two and three characters. Several ways of putting the commands in
 //! order are judged on the same pass, so they see the same history.
 //!
+//! The person typing is imagined two ways: one who types every letter in
+//! the case the command has it, and one who types every letter in lower
+//! case and leaves the case to the suggestion. Neither counts Shift as a
+//! key. For the second, a command is typed right only up to the last
+//! suggestion taken, which puts the case right, and the rest is typed as
+//! it was in lower case; it costs as many keys either way.
+//!
 //! The filesystem is not judged: whether a path was there when a command
 //! ran is not recorded anywhere. The project a directory is in is taken
 //! from the filesystem as it is now.
@@ -22,7 +29,36 @@ use std::path::Path;
 use crate::history::Past;
 use crate::index::{Index, Order, Run, Weights};
 use crate::paths::Look;
-use crate::text;
+use crate::text::{self, Start};
+
+/// How the person imagined types a letter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Typist {
+    /// In the case the command has it.
+    Exact,
+    /// In lower case.
+    Lower,
+}
+
+impl Typist {
+    fn key(self, c: char) -> char {
+        match self {
+            Self::Exact => c,
+            Self::Lower => text::fold(c),
+        }
+    }
+
+    fn line(self, typed: &str) -> String {
+        typed.chars().map(|c| self.key(c)).collect()
+    }
+}
+
+/// One way of suggesting judged: an order, and a person typing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Way {
+    pub order: Order,
+    pub typist: Typist,
+}
 
 /// How many characters are counted for "right after".
 pub const AFTER: usize = 3;
@@ -104,23 +140,27 @@ fn count_chars(text: &str) -> u64 {
     u64::try_from(text.chars().count()).unwrap_or(u64::MAX)
 }
 
-/// What taking the suggestion `offered` for the first `at` bytes of
-/// `command` gets, if it gets anything: where the line then ends. The whole
-/// suggestion if it is right, else its next word while that is right. Only
-/// a gain of two characters or more is worth the key.
-fn take(command: &str, offered: &str, at: usize) -> Option<usize> {
+/// What taking the suggestion `offered` for `line`, the start of `command`
+/// as it was typed, gets, if it gets anything: where in `command` the line
+/// then ends. The whole suggestion if it is right, else its next word while
+/// that is right; either way, in the case `command` has it. Only a gain of
+/// two characters or more is worth the key.
+fn take(command: &str, offered: &str, line: &str) -> Option<usize> {
+    let chars = line.chars().count();
+    let at = char_start(command, chars);
     let gain = |end: usize| count_chars(command.get(at..end).unwrap_or_default()) >= 2;
     if offered.len() > at && command.starts_with(offered) && gain(offered.len()) {
         return Some(offered.len());
     }
-    let rest = offered.get(at..)?;
-    let end = at.saturating_add(text::word_end(rest));
+    let from = char_start(offered, chars);
+    let rest = offered.get(from..)?;
+    let end = from.saturating_add(text::word_end(rest));
     let part = offered.get(..end)?;
-    (end > at && command.starts_with(part) && gain(end)).then_some(end)
+    (end > from && command.starts_with(part) && gain(end)).then_some(end)
 }
 
-/// The keys it takes to type `command` with `ask` suggesting.
-fn type_one<'a>(command: &str, ask: &dyn Fn(&str) -> Option<&'a str>) -> Typed {
+/// The keys it takes `typist` to type `command` with `ask` suggesting.
+fn type_one<'a>(command: &str, typist: Typist, ask: &dyn Fn(&str) -> Option<&'a str>) -> Typed {
     let mut typed = Typed {
         chars: count_chars(command),
         ..Typed::default()
@@ -132,28 +172,28 @@ fn type_one<'a>(command: &str, ask: &dyn Fn(&str) -> Option<&'a str>) -> Typed {
                 *slot = true;
             }
             if let Some(slot) = typed.right.get_mut(n) {
-                *slot = ask(command.get(..end).unwrap_or_default()) == Some(command);
+                let line = typist.line(command.get(..end).unwrap_or_default());
+                *slot = ask(&line) == Some(command);
             }
         }
     }
+    // Where the line ends in the command, and the line as typed.
     let mut at = 0;
+    let mut line = String::new();
     // Each turn takes a suggestion or types a character, so the line grows.
     for _ in 0..command.len().saturating_add(1) {
-        if at >= command.len() {
+        let Some(c) = command.get(at..).and_then(|rest| rest.chars().next()) else {
             break;
-        }
+        };
         typed.keys = typed.keys.saturating_add(1);
-        let offered = (at > 0)
-            .then(|| ask(command.get(..at).unwrap_or_default()))
-            .flatten();
-        if let Some(end) = offered.and_then(|offered| take(command, offered, at)) {
+        let offered = (at > 0).then(|| ask(&line)).flatten();
+        if let Some(end) = offered.and_then(|offered| take(command, offered, &line)) {
             at = end;
+            command.get(..end).unwrap_or_default().clone_into(&mut line);
             continue;
         }
-        at = command
-            .get(at..)
-            .and_then(|rest| rest.chars().next())
-            .map_or(command.len(), |c| at.saturating_add(c.len_utf8()));
+        at = at.saturating_add(c.len_utf8());
+        line.push(typist.key(c));
     }
     typed
 }
@@ -161,8 +201,8 @@ fn type_one<'a>(command: &str, ask: &dyn Fn(&str) -> Option<&'a str>) -> Typed {
 /// What a replay found.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Replayed {
-    /// How each order did, in the order asked.
-    pub orders: Vec<Score>,
+    /// How each way did, in the order asked.
+    pub ways: Vec<Score>,
     /// How a suggester did that knows the command whenever it was run
     /// before, and suggests nothing for one that is new: the most any order
     /// of the history can give for the commands it has seen.
@@ -170,17 +210,17 @@ pub struct Replayed {
 }
 
 /// Replay `past`, learning every command and judging those from index
-/// `from` up to `to`, with each of `orders`, ranked with `weights`.
+/// `from` up to `to`, each of `ways`, ranked with `weights`.
 #[must_use]
 pub fn replay(
     past: &[Past],
     weights: Weights,
     range: (usize, usize),
-    orders: &[Order],
+    ways: &[Way],
     look: &mut Look,
 ) -> Replayed {
     let (from, to) = range;
-    let mut scores = vec![Score::default(); orders.len()];
+    let mut scores = vec![Score::default(); ways.len()];
     let mut knowing = Score::default();
     let mut index = Index::with_weights(weights);
     let mut before: HashMap<&str, &str> = HashMap::new();
@@ -202,16 +242,19 @@ pub fn replay(
         let known = index.knows(&one.command);
         if judged && index.push(&run).is_ok() {
             let command = one.command.as_str();
-            let ask = |line: &str| (known && command.starts_with(line)).then_some(command);
-            knowing.add(&type_one(command, &ask));
+            // The same keys whoever types: it suggests the command whatever
+            // case the line is in.
+            let ask =
+                |line: &str| (known && text::start(command, line) != Start::No).then_some(command);
+            knowing.add(&type_one(command, Typist::Exact, &ask));
             // Pushed to find out whether it would be taken in at all; it is
             // not searchable until the commit, after it has been typed.
-            for (order, score) in orders.iter().zip(scores.iter_mut()) {
+            for (way, score) in ways.iter().zip(scores.iter_mut()) {
                 let ask = |line: &str| {
-                    let best = index.ranked(line, *order);
+                    let best = index.ranked(line, way.order);
                     best.first().map(|id| index.command(id))
                 };
-                score.add(&type_one(&one.command, &ask));
+                score.add(&type_one(&one.command, way.typist, &ask));
             }
         } else if !judged {
             let _ = index.push(&run);
@@ -220,7 +263,7 @@ pub fn replay(
         before.insert(&one.session, &one.command);
     }
     Replayed {
-        orders: scores,
+        ways: scores,
         knowing,
     }
 }
@@ -244,8 +287,10 @@ const TUNABLE: usize = 6;
 const ROUNDS: usize = 6;
 
 /// The weights that type `past` from `from` to `to` with the fewest keys,
-/// found by trying each weight halved and doubled in turn, from `start`,
-/// until nothing helps. Returns them and their score.
+/// typed in the case each command has, found by trying each weight halved
+/// and doubled in turn, from `start`, until nothing helps. Returns them and
+/// their score. The weight of a fit but for case is left as it is: typed
+/// that way, only an exact fit is ever right.
 #[must_use]
 pub fn tune(
     past: &[Past],
@@ -253,9 +298,13 @@ pub fn tune(
     range: (usize, usize),
     look: &mut Look,
 ) -> (Weights, Score) {
+    let likely = Way {
+        order: Order::Likely,
+        typist: Typist::Exact,
+    };
     let judge = |weights: Weights, look: &mut Look| {
-        replay(past, weights, range, &[Order::Likely], look)
-            .orders
+        replay(past, weights, range, &[likely], look)
+            .ways
             .first()
             .copied()
             .unwrap_or_default()

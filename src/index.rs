@@ -1,10 +1,14 @@
 //! The history, ready to be asked "what comes after this?" in microseconds.
 //!
-//! Every distinct command is kept once, in a list sorted by its text, so the
-//! commands that start with what has been typed are one run of that list,
-//! found by two binary searches. Beside it, for each command, what it is
-//! worth in the whole history; and for each directory, a scope of the
-//! commands run there, searchable the same way. The project the shell is in
+//! Every distinct command is kept once, in a list sorted by its text with
+//! case set aside ([`text::key_cmp`]), so the commands that start with what
+//! has been typed, in any case, are one run of that list, found by two
+//! binary searches. Of those, the ones that fit are the ones that have every
+//! capital that was typed ([`text::start`]). Beside it, for each command,
+//! what it is worth in the whole history and which of its first characters
+//! are capitals, so that most of a run is judged without reading its text;
+//! and for each directory, a scope of the commands run there, searchable the
+//! same way. The project the shell is in
 //! gets a scope too, made from the directories under it. And for each
 //! command, what was run next in the same session, and how often.
 //!
@@ -27,7 +31,7 @@ pub use rank::{Best, Weights};
 use scope::Scope;
 use worth::NONE;
 
-use crate::text::is_typeable;
+use crate::text::{self, Start, is_typeable};
 
 /// A command longer than this is not kept: it would not fit on a row anyway,
 /// and a few huge pasted lines should not decide how much memory this uses.
@@ -75,7 +79,8 @@ pub enum Refused {
 pub enum Order {
     /// By the chance of being meant (see [`rank`]).
     Likely,
-    /// The most recent, as fish has it.
+    /// The most recent, as fish has it: in the case typed if any fits so,
+    /// else in any case.
     Recent,
     /// The most recent, but one run in this directory before all others, as
     /// inkling had it before.
@@ -173,6 +178,9 @@ pub struct Index {
     last: Vec<u32>,
     /// What each command is worth in the whole history, in that order.
     anchor: Vec<f64>,
+    /// Which of each command's first characters are capitals, in that order
+    /// (see [`text::capitals`]).
+    cases: Vec<u64>,
     /// The whole history's runs together.
     mass: f64,
     pending: Vec<Pending>,
@@ -216,6 +224,7 @@ impl Index {
             pos: Vec::new(),
             last: Vec::new(),
             anchor: Vec::new(),
+            cases: Vec::new(),
             mass: NONE,
             pending: Vec::new(),
             pending_arena: String::new(),
@@ -355,7 +364,9 @@ impl Index {
         let mut new_texts: HashMap<&str, u32> = HashMap::new();
         for row in rows {
             let text = slice(arena, row.text);
-            let at = self.sorted.partition_point(|&id| self.text(id) < text);
+            let at = self
+                .sorted
+                .partition_point(|&id| text::key_cmp(self.text(id), text).is_lt());
             let known = self
                 .sorted
                 .get(at)
@@ -389,9 +400,10 @@ impl Index {
         if fresh.is_empty() {
             return;
         }
-        fresh.sort_by(|a, b| self.text(*a).cmp(self.text(*b)));
+        fresh.sort_by(|a, b| text::key_cmp(self.text(*a), self.text(*b)));
         let total = self.sorted.len().saturating_add(fresh.len());
-        let (mut sorted, mut last, mut anchor) = (
+        let (mut sorted, mut last, mut anchor, mut cases) = (
+            Vec::with_capacity(total),
             Vec::with_capacity(total),
             Vec::with_capacity(total),
             Vec::with_capacity(total),
@@ -402,7 +414,7 @@ impl Index {
         for _ in 0..total {
             let old_id = old.peek().and_then(|&at| self.sorted.get(at)).copied();
             let take_old = match (old_id, new.peek()) {
-                (Some(a), Some(b)) => self.text(a) <= self.text(**b),
+                (Some(a), Some(b)) => text::key_cmp(self.text(a), self.text(**b)).is_le(),
                 (Some(_), None) => true,
                 (None, Some(_)) => false,
                 (None, None) => break,
@@ -412,13 +424,15 @@ impl Index {
                 sorted.push(self.sorted.get(at).copied().unwrap_or(0));
                 last.push(self.last.get(at).copied().unwrap_or(0));
                 anchor.push(self.anchor.get(at).copied().unwrap_or(NONE));
+                cases.push(self.cases.get(at).copied().unwrap_or(0));
             } else if let Some(&id) = new.next() {
                 sorted.push(id);
                 last.push(0);
                 anchor.push(NONE);
+                cases.push(text::capitals(self.text(id)));
             }
         }
-        (self.sorted, self.last, self.anchor) = (sorted, last, anchor);
+        (self.sorted, self.last, self.anchor, self.cases) = (sorted, last, anchor, cases);
         self.pos = vec![0; self.spans.len()];
         for (at, &id) in self.sorted.iter().enumerate() {
             if let Some(slot) = usize::try_from(id).ok().and_then(|id| self.pos.get_mut(id)) {
@@ -529,7 +543,9 @@ impl Index {
     }
 
     fn id_of(&self, text: &str) -> Option<u32> {
-        let at = self.sorted.partition_point(|&id| self.text(id) < text);
+        let at = self
+            .sorted
+            .partition_point(|&id| text::key_cmp(self.text(id), text).is_lt());
         self.sorted
             .get(at)
             .copied()
@@ -560,91 +576,140 @@ impl Index {
             + w.follows * follows
     }
 
-    /// The commands that start with `line` and are longer, in the sorted
-    /// list: from, to.
+    /// The commands that start with `line`, case aside, in the sorted list:
+    /// from, to.
     fn run(&self, line: &str) -> (usize, usize) {
-        let low = self.sorted.partition_point(|&id| self.text(id) < line);
+        let low = self
+            .sorted
+            .partition_point(|&id| text::fold_cmp(self.text(id), line).is_lt());
         let tail = self.sorted.get(low..).unwrap_or_default();
-        let len = tail.partition_point(|&id| self.text(id).starts_with(line));
-        let mut from = low;
-        // The command that is exactly what was typed has nothing to add.
-        if len > 0 && tail.first().is_some_and(|&id| self.text(id) == line) {
-            from = from.saturating_add(1);
-        }
-        (from, low.saturating_add(len))
+        let len = tail.partition_point(|&id| text::starts_folded(self.text(id), line));
+        (low, low.saturating_add(len))
     }
 
-    /// The best few commands that start with `line` and are longer, in
-    /// `order`, best first.
+    /// What a command that fits as `start` counts for, if it fits.
+    fn weight(&self, start: Start) -> Option<f64> {
+        match start {
+            Start::Exact => Some(1.0),
+            Start::Loose => Some(self.weights.case),
+            Start::No => None,
+        }
+    }
+
+    /// Offer command `id` to `best` with its score, if it fits `query`.
+    fn consider(&self, best: &mut Best, id: u32, query: &Query<'_>) {
+        if let Some(weight) = self.weight(query.fit(self.text(id))) {
+            best.offer(id, self.score(id) * weight);
+        }
+    }
+
+    /// The best few commands that fit `line` and are longer, in `order`,
+    /// best first.
     #[must_use]
     pub fn ranked(&self, line: &str, order: Order) -> Best {
         if line.is_empty() {
             return Best::default();
         }
+        let query = Query::new(line);
         match order {
-            Order::Likely => self.likely(line),
-            Order::Recent => self.recent(line, false),
-            Order::RecentHereFirst => self.recent(line, true),
+            Order::Likely => self.likely(&query),
+            Order::Recent => self.recent(&query, false),
+            Order::RecentHereFirst => self.recent(&query, true),
         }
     }
 
-    fn likely(&self, line: &str) -> Best {
-        let (from, to) = self.run(line);
+    fn likely(&self, query: &Query<'_>) -> Best {
+        let (from, to) = self.run(query.line);
         // The whole history's best by worth alone: any command that no
         // other estimate knows scores by that, so one of these, or one the
-        // others know, is the best of all.
+        // others know, is the best of all. What can be told without the
+        // text is asked first: whether the worth is enough, then whether
+        // the capitals are.
         let mut worthiest = Best::default();
         let stretch = self.anchor.get(from..to).unwrap_or_default();
-        for (offset, &anchor) in stretch.iter().enumerate().take(MAX_SCAN) {
-            let at = from.saturating_add(offset);
-            if let Some(&id) = self.sorted.get(at) {
-                worthiest.offer(id, anchor);
+        let masks = self.cases.get(from..to).unwrap_or_default();
+        for (offset, (&anchor, &mask)) in stretch.iter().zip(masks).enumerate().take(MAX_SCAN) {
+            if !worthiest.would_take(anchor) {
+                continue;
+            }
+            let Some(guess) = self.weight(query.guess(mask)) else {
+                continue;
+            };
+            let id = self.sorted.get(from.saturating_add(offset)).copied();
+            if let (true, Some(id)) = (worthiest.would_take(anchor + guess.ln()), id)
+                && let Some(weight) = self.weight(query.fit(self.text(id)))
+            {
+                worthiest.offer(id, anchor + weight.ln());
             }
         }
         let mut best = Best::default();
         for id in worthiest.ids() {
-            best.offer(id, self.score(id));
+            self.consider(&mut best, id, query);
         }
         let text = |id: u32| self.text(id);
         let scopes = [self.here(), self.project.as_ref().map(|p| &p.scope)];
         for scope in scopes.into_iter().flatten() {
-            for &id in scope.starting(line, text).iter().take(MAX_LOCAL) {
-                if self.text(id) != line {
-                    best.offer(id, self.score(id));
-                }
+            for &id in scope.starting(query.line, text).iter().take(MAX_LOCAL) {
+                self.consider(&mut best, id, query);
             }
         }
         let follows = self.prev.and_then(|prev| self.follows.get(&prev));
         for &(id, _) in follows.map(|f| f.next.as_slice()).unwrap_or_default() {
-            let fits = self.text(id);
-            if fits.starts_with(line) && fits != line {
-                best.offer(id, self.score(id));
-            }
+            self.consider(&mut best, id, query);
         }
         best
     }
 
-    fn recent(&self, line: &str, here_first: bool) -> Best {
-        let mut best = Best::default();
-        if here_first && let Some(scope) = self.here() {
-            let text = |id: u32| self.text(id);
-            for &id in scope.starting(line, text).iter().take(MAX_LOCAL) {
-                if let (true, Some(stat)) = (self.text(id) != line, scope.stat(id)) {
-                    best.offer(id, f64::from(stat.last));
-                }
-            }
-            if !best.is_empty() {
-                return best;
-            }
+    /// The most recent first, in the two ways it has been done before.
+    ///
+    /// inkling's first rule (`here_first`) minded case, and put a command run in
+    /// this directory before all others. fish takes the most recent command
+    /// that starts with the line as typed and, only when history has none,
+    /// the most recent that starts with it in any case at all, a capital
+    /// typed or not (`reader.rs`, `get_autosuggestion_performer`).
+    fn recent(&self, query: &Query<'_>, here_first: bool) -> Best {
+        if here_first && let Some(best) = self.recent_here(query) {
+            return best;
         }
-        let (from, to) = self.run(line);
+        let (from, to) = self.run(query.line);
         let stretch = self.last.get(from..to).unwrap_or_default();
-        for (offset, &last) in stretch.iter().enumerate().take(MAX_SCAN) {
-            if let Some(&id) = self.sorted.get(from.saturating_add(offset)) {
-                best.offer(id, f64::from(last));
+        let masks = self.cases.get(from..to).unwrap_or_default();
+        let (mut exact, mut any) = (Best::default(), Best::default());
+        for (offset, (&last, &mask)) in stretch.iter().zip(masks).enumerate().take(MAX_SCAN) {
+            let score = f64::from(last);
+            let for_exact = exact.would_take(score) && query.guess(mask) == Start::Exact;
+            let for_any = !here_first && exact.is_empty() && any.would_take(score);
+            if !for_exact && !for_any {
+                continue;
+            }
+            let Some(id) = self.sorted.get(from.saturating_add(offset)).copied() else {
+                continue;
+            };
+            let command = self.text(id);
+            if !text::longer(command, query.chars) {
+                continue;
+            }
+            if for_exact && text::start(command, query.line) == Start::Exact {
+                exact.offer(id, score);
+            } else if for_any {
+                any.offer(id, score);
             }
         }
-        best
+        if exact.is_empty() { any } else { exact }
+    }
+
+    /// The most recent of the commands run here that start with the line
+    /// as typed, if there are any.
+    fn recent_here(&self, query: &Query<'_>) -> Option<Best> {
+        let scope = self.here()?;
+        let text = |id: u32| self.text(id);
+        let mut best = Best::default();
+        for &id in scope.starting(query.line, text).iter().take(MAX_LOCAL) {
+            if let (Start::Exact, Some(stat)) = (query.fit(self.text(id)), scope.stat(id)) {
+                best.offer(id, f64::from(stat.last));
+            }
+        }
+        (!best.is_empty()).then_some(best)
     }
 
     /// The text of command `id`.
@@ -653,8 +718,8 @@ impl Index {
         self.text(id)
     }
 
-    /// The command to suggest for `line`: the likeliest that starts with it
-    /// and is longer.
+    /// The command to suggest for `line`: the likeliest that fits it and is
+    /// longer.
     #[must_use]
     pub fn suggest(&self, line: &str) -> Option<&str> {
         self.ranked(line, Order::Likely)
@@ -664,18 +729,81 @@ impl Index {
 
     /// What a program's name is worth as the first word of a line: the share
     /// of the whole history held by the command that is just the name and by
-    /// those that start with it and a blank.
+    /// those that start with it and a blank, in its own case.
     #[must_use]
     pub fn word_worth(&self, word: &str) -> f64 {
-        let exact = self.id_of(word).and_then(|id| self.place(id));
-        let (from, to) = self.run(&format!("{word} "));
-        let mut total = 0.0;
-        for at in (from..to).take(MAX_SCAN).chain(exact) {
-            if let Some(&anchor) = self.anchor.get(at) {
-                total += worth::share(anchor, self.mass);
+        let share = |at: usize| {
+            self.anchor
+                .get(at)
+                .map_or(0.0, |&anchor| worth::share(anchor, self.mass))
+        };
+        let mut total = self
+            .id_of(word)
+            .and_then(|id| self.place(id))
+            .map_or(0.0, share);
+        let prefix = format!("{word} ");
+        let query = Query::new(&prefix);
+        let (from, to) = self.run(&prefix);
+        for at in (from..to).take(MAX_SCAN) {
+            let mask = self.cases.get(at).copied().unwrap_or(0);
+            let id = self.sorted.get(at).copied();
+            let exact = query.guess(mask) == Start::Exact
+                && id.is_some_and(|id| self.text(id).starts_with(&prefix));
+            if exact {
+                total += share(at);
             }
         }
         total
+    }
+}
+
+/// What was typed, as the commands are measured against it.
+struct Query<'a> {
+    line: &'a str,
+    /// How many characters it has.
+    chars: usize,
+    /// Which of its first characters are capitals ([`text::capitals`]).
+    capitals: u64,
+    /// The bits of the characters that [`text::capitals`] looks at.
+    span: u64,
+}
+
+impl<'a> Query<'a> {
+    fn new(line: &'a str) -> Self {
+        let chars = line.chars().count();
+        let looked = u32::try_from(chars.min(text::CAPITALS)).unwrap_or(u32::MAX);
+        let span = 1_u64
+            .checked_shl(looked)
+            .map_or(u64::MAX, |bit| bit.wrapping_sub(1));
+        Self {
+            line,
+            chars,
+            capitals: text::capitals(line),
+            span,
+        }
+    }
+
+    /// How a command in the run of `line` fits, as far as its capitals,
+    /// `mask`, tell: `No` and `Loose` for certain, `Exact` perhaps.
+    fn guess(&self, mask: u64) -> Start {
+        let have = mask & self.span;
+        if have & self.capitals != self.capitals {
+            Start::No
+        } else if have == self.capitals {
+            Start::Exact
+        } else {
+            Start::Loose
+        }
+    }
+
+    /// How `command` fits: as [`text::start`] has it, and only if it is
+    /// longer than what was typed.
+    fn fit(&self, command: &str) -> Start {
+        if text::longer(command, self.chars) {
+            text::start(command, self.line)
+        } else {
+            Start::No
+        }
     }
 }
 

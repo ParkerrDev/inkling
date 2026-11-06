@@ -23,6 +23,8 @@ pub struct Env {
     pub xdg_data_home: Option<PathBuf>,
     /// Atuin's `ATUIN_DB_PATH`.
     pub atuin_db: Option<PathBuf>,
+    /// Atuin's `ATUIN_HOME`.
+    pub atuin_home: Option<PathBuf>,
     /// The shell's history file: the one the shell told inkling about, else
     /// `HISTFILE`.
     pub histfile: Option<PathBuf>,
@@ -42,22 +44,34 @@ impl Env {
             home: absolute(var("HOME")),
             xdg_data_home: absolute(var("XDG_DATA_HOME")),
             atuin_db: absolute(var("ATUIN_DB_PATH")),
+            atuin_home: absolute(var("ATUIN_HOME")),
             histfile: absolute(var("INKLING_HISTFILE").filter(|v| !v.is_empty()))
                 .or_else(|| absolute(var("HISTFILE"))),
         }
     }
 
-    /// Atuin's database, if the environment points at one.
+    /// Atuin's database, where Atuin 18 looks for it: `ATUIN_DB_PATH`;
+    /// else in `ATUIN_HOME`; else in `~/.atuin/data` if that is there (a
+    /// `~/.atuin` with only Atuin's logs in it does not count); else where
+    /// Atuin kept it before (`XDG_DATA_HOME`, `~/.local/share`) if that is
+    /// there; else in `~/.atuin/data`, where a new one is made.
     #[must_use]
     pub fn atuin_path(&self) -> Option<PathBuf> {
         if let Some(path) = &self.atuin_db {
             return Some(path.clone());
         }
-        let data = self
-            .xdg_data_home
-            .clone()
-            .or_else(|| self.home.as_ref().map(|home| home.join(".local/share")))?;
-        Some(data.join("atuin/history.db"))
+        if let Some(home) = &self.atuin_home {
+            return Some(home.join("data/history.db"));
+        }
+        let home = self.home.as_ref()?;
+        let own = home.join(".atuin/data");
+        let shared = home.join(".local/share");
+        let data = self.xdg_data_home.as_ref().unwrap_or(&shared);
+        let was = [&shared, data].iter().any(|dir| dir.join("atuin").is_dir());
+        if was && !own.is_dir() {
+            return Some(data.join("atuin/history.db"));
+        }
+        Some(own.join("history.db"))
     }
 
     /// The history file bash writes.
@@ -157,5 +171,74 @@ impl Source {
         };
         index.commit();
         Ok(read)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Env;
+    use std::path::{Path, PathBuf};
+
+    fn env(home: &Path) -> Env {
+        Env {
+            home: Some(home.to_path_buf()),
+            ..Env::default()
+        }
+    }
+
+    fn mkdir(path: PathBuf) {
+        std::fs::create_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn atuins_database_is_found_where_atuin_18_keeps_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let new = home.join(".atuin/data/history.db");
+        assert_eq!(env(home).atuin_path(), Some(new.clone()), "a new home");
+        mkdir(home.join(".local/share/atuin"));
+        let old = home.join(".local/share/atuin/history.db");
+        assert_eq!(env(home).atuin_path(), Some(old), "kept from before");
+        let xdg = Env {
+            xdg_data_home: Some(home.join("xd")),
+            ..env(home)
+        };
+        let moved = home.join("xd/atuin/history.db");
+        assert_eq!(xdg.atuin_path(), Some(moved), "kept from before, moved");
+        mkdir(home.join(".atuin/logs"));
+        let kept = env(home).atuin_path();
+        assert_eq!(kept, Some(home.join(".local/share/atuin/history.db")));
+        mkdir(home.join(".atuin/data"));
+        assert_eq!(env(home).atuin_path(), Some(new), "its own over before");
+    }
+
+    #[test]
+    fn atuins_own_variables_come_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        mkdir(home.join(".local/share/atuin"));
+        let given = Env {
+            atuin_home: Some(home.join("ah")),
+            ..env(home)
+        };
+        let data = home.join("ah/data/history.db");
+        assert_eq!(given.atuin_path(), Some(data));
+        let db = Env {
+            atuin_db: Some(home.join("db")),
+            ..given
+        };
+        assert_eq!(db.atuin_path(), Some(home.join("db")));
+    }
+
+    #[test]
+    fn a_data_home_where_atuin_kept_it_before_is_found_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        mkdir(home.join("xd/atuin"));
+        let xdg = Env {
+            xdg_data_home: Some(home.join("xd")),
+            ..env(home)
+        };
+        assert_eq!(xdg.atuin_path(), Some(home.join("xd/atuin/history.db")));
     }
 }

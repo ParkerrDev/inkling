@@ -1156,8 +1156,17 @@ mod atuin {
         format!("source {PREEXEC}\neval \"$(atuin init bash)\"")
     }
 
+    /// The commands Atuin has recorded, in the database it chose: a new
+    /// home has it in `~/.atuin` since Atuin 18.
     fn recorded(sandbox: &Sandbox) -> Vec<String> {
-        let path = sandbox.home().join(".local/share/atuin/history.db");
+        let env = inkling::history::Env {
+            home: Some(sandbox.home().clone()),
+            xdg_data_home: Some(sandbox.home().join(".local/share")),
+            ..inkling::history::Env::default()
+        };
+        let Some(path) = env.atuin_path().filter(|path| path.is_file()) else {
+            return Vec::new();
+        };
         let Ok(conn) = rusqlite::Connection::open(path) else {
             return Vec::new();
         };

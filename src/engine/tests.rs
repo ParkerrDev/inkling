@@ -21,7 +21,8 @@ impl Tty for Fake {
     }
 }
 
-/// History, oldest first; the last match is the most recent.
+/// History, oldest first; the last match is the most recent. A letter
+/// typed in lower case fits either case.
 struct Words(Vec<&'static str>);
 
 impl Suggest for Words {
@@ -29,7 +30,9 @@ impl Suggest for Words {
         self.0
             .iter()
             .rev()
-            .find(|c| c.starts_with(line) && c.len() > line.len())
+            .find(|c| {
+                text::start(c, line) != text::Start::No && text::longer(c, line.chars().count())
+            })
             .map(|c| Cow::Borrowed(*c))
     }
 }
@@ -973,6 +976,53 @@ fn taking_the_suggestion_is_drawn_ahead_as_typed_text() {
     sim.output(&reply("git status", 10));
     sim.wait(1);
     assert_eq!(sim.take_terminal(), b"\x1b[7D\x1b[K\r\x1b[K\rP> git status");
+}
+
+#[test]
+fn a_line_in_lower_case_is_shown_the_rest_of_the_command_with_capitals() {
+    let mut sim = Sim::new(&["cd ~/Dev/GitHub"]);
+    sim.prompt_unknown();
+    let sent = sim.type_and_settle(b"cd ~/dev", "cd ~/dev");
+    let mut expect = b"\r\x1b[K\rP> cd ~/dev".to_vec();
+    expect.extend(drawn("/GitHub"));
+    assert_eq!(sent, expect, "the line keeps its case until it is taken");
+}
+
+#[test]
+fn taking_it_deletes_back_to_the_first_letter_in_the_wrong_case_first() {
+    let mut sim = Sim::new(&["cd ~/Dev/GitHub"]);
+    sim.prompt();
+    sim.type_and_settle(b"cd ~/dev", "cd ~/dev");
+    sim.input(b"\x1b[C");
+    assert_eq!(sim.take_shell(), probed(b"\x7f\x7f\x7fDev/GitHub"));
+    // Drawn ahead: back over "dev", then the command's own case and rest.
+    let mut ahead = b"\x1b[3D\x1b[K".to_vec();
+    ahead.extend(typed("Dev/GitHub"));
+    assert_eq!(sim.take_terminal(), ahead);
+    sim.output(&reply("cd ~/Dev/GitHub", 15));
+    sim.wait(1);
+    assert_eq!(
+        sim.take_terminal(),
+        b"\x1b[7D\x1b[K\r\x1b[K\rP> cd ~/Dev/GitHub",
+        "the shell's redraw lands where it has the cursor"
+    );
+}
+
+#[test]
+fn taking_one_word_puts_the_case_right_too() {
+    let mut sim = Sim::new(&["cd ~/Dev/GitHub/inkling"]);
+    sim.prompt();
+    sim.type_and_settle(b"cd ~/dev/g", "cd ~/dev/g");
+    sim.input(b"\x1bf");
+    assert_eq!(sim.take_shell(), probed(b"\x7f\x7f\x7f\x7f\x7fDev/GitHub"));
+}
+
+#[test]
+fn a_capital_typed_is_never_put_in_lower_case() {
+    let mut sim = Sim::new(&["cd ~/dotfiles"]);
+    sim.prompt_unknown();
+    let sent = sim.type_and_settle(b"cd ~/D", "cd ~/D");
+    assert_eq!(sent, b"\r\x1b[K\rP> cd ~/D", "no suggestion");
 }
 
 #[test]

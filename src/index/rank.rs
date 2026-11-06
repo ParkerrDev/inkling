@@ -10,6 +10,11 @@
 //! * how often it was the next command after the one just run, in the same
 //!   session.
 //!
+//! A command that fits what was typed only because letters typed in lower
+//! case are capitals in it (see [`crate::text`]) has its chance multiplied
+//! by [`Weights::case`]: someone who did not reach for Shift is likelier to
+//! have meant a command that has the letters as typed.
+//!
 //! A failed run counts for less than one that went well. A scope the shell
 //! has never run anything in adds nothing, so the mixture falls back to what
 //! is known. Because each share is taken within its own scope, ten commands
@@ -35,6 +40,9 @@ pub struct Weights {
     pub follows: f64,
     /// What a failed run counts for, against 1 for one that went well.
     pub failed: f64,
+    /// What a command counts for that fits only with letters typed in
+    /// lower case taken for capitals, against 1 for one that fits exactly.
+    pub case: f64,
 }
 
 impl Default for Weights {
@@ -47,6 +55,7 @@ impl Default for Weights {
             directory: 2.0,
             follows: 1.0,
             failed: 0.3,
+            case: 0.25,
         }
     }
 }
@@ -90,6 +99,16 @@ impl Best {
             *slot = (id, score);
         }
         self.len = self.len.saturating_add(1).min(BEST);
+    }
+
+    /// Whether a command with `score` would be kept if offered.
+    #[must_use]
+    pub fn would_take(&self, score: f64) -> bool {
+        self.len < BEST
+            || self
+                .items
+                .get(BEST.saturating_sub(1))
+                .is_some_and(|&(_, last)| last < score)
     }
 
     /// The ids, best first.
@@ -143,6 +162,8 @@ mod tests {
         assert_eq!(best.len(), BEST);
         assert_eq!(best.first(), Some(19));
         assert_eq!(best.ids().last(), Some(12));
+        assert!(!best.would_take(-1.0) && !best.would_take(12.0));
+        assert!(best.would_take(12.5));
         best.offer(99, -1.0);
         assert!(!best.ids().any(|id| id == 99), "worse than all kept");
     }

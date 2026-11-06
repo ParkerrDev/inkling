@@ -16,6 +16,8 @@ impl Tree {
             "proj/build",
             "home/Documents",
             "home/Downloads",
+            "home/Dev/GitHub",
+            "home/Dev/gitea",
             "bin",
         ] {
             std::fs::create_dir_all(root.join(folder)).unwrap();
@@ -28,7 +30,7 @@ impl Tree {
         ] {
             std::fs::write(root.join(file), b"").unwrap();
         }
-        for program in ["cargo", "cargo-deny", "carbonyl", "ls"] {
+        for program in ["cargo", "cargo-deny", "carbonyl", "ls", "VBoxManage"] {
             std::fs::write(root.join("bin").join(program), b"").unwrap();
         }
         Self { dir }
@@ -129,14 +131,17 @@ fn a_word_in_a_commands_place_is_finished_as_a_program() {
         None,
         "they share no more than that"
     );
-    assert_eq!(look.finish("carg", &unknown), Some("o".to_owned()));
+    assert_eq!(look.finish("carg", &unknown), Some("cargo".to_owned()));
     let used = |name: &str| if name == "carbonyl" { 0.5 } else { 0.0 };
-    assert_eq!(look.finish("car", &used), Some("bonyl".to_owned()));
+    assert_eq!(look.finish("car", &used), Some("carbonyl".to_owned()));
     assert_eq!(
         look.finish("make && carb", &unknown),
-        Some("onyl".to_owned())
+        Some("make && carbonyl".to_owned())
     );
-    assert_eq!(look.finish("sudo carb", &unknown), Some("onyl".to_owned()));
+    assert_eq!(
+        look.finish("sudo carb", &unknown),
+        Some("sudo carbonyl".to_owned())
+    );
     assert_eq!(look.finish("zzz", &unknown), None);
 }
 
@@ -147,12 +152,12 @@ fn a_later_word_is_finished_as_a_path() {
     let unknown = |_: &str| 0.0;
     assert_eq!(
         look.finish("vim src/ma", &unknown),
-        Some("in.rs".to_owned())
+        Some("vim src/main.rs".to_owned())
     );
-    assert_eq!(look.finish("ls sr", &unknown), Some("c/".to_owned()));
+    assert_eq!(look.finish("ls sr", &unknown), Some("ls src/".to_owned()));
     assert_eq!(
         look.finish("cat notes", &unknown),
-        Some("\\ with\\ space.txt".to_owned())
+        Some("cat notes\\ with\\ space.txt".to_owned())
     );
     assert_eq!(
         look.finish("cd src/main", &unknown),
@@ -165,13 +170,70 @@ fn a_later_word_is_finished_as_a_path() {
         "nothing typed of the word"
     );
     let mut home = tree.look("home");
-    assert_eq!(home.finish("ls .h", &unknown), Some("idden".to_owned()));
-    assert_eq!(home.finish("ls r", &unknown), Some("eadme.md".to_owned()));
+    assert_eq!(
+        home.finish("ls .h", &unknown),
+        Some("ls .hidden".to_owned())
+    );
+    assert_eq!(
+        home.finish("ls r", &unknown),
+        Some("ls readme.md".to_owned())
+    );
     // Documents and Downloads share only "Do": the newest of the two.
     assert!(home.finish("cd Do", &unknown).is_some());
     assert_eq!(
         home.finish("ls ~/Doc", &unknown),
-        Some("uments/".to_owned())
+        Some("ls ~/Documents/".to_owned())
+    );
+}
+
+#[test]
+fn a_word_in_lower_case_is_finished_in_the_case_of_the_name() {
+    let tree = Tree::new();
+    let mut home = tree.look("home");
+    let unknown = |_: &str| 0.0;
+    assert_eq!(
+        home.finish("ls docu", &unknown),
+        Some("ls Documents/".to_owned())
+    );
+    // An exact fit comes first: readme.md, not a capital R anything.
+    assert_eq!(
+        home.finish("ls r", &unknown),
+        Some("ls readme.md".to_owned())
+    );
+    assert_eq!(
+        home.finish("ls Docu", &unknown),
+        Some("ls Documents/".to_owned())
+    );
+    assert_eq!(home.finish("ls DOCU", &unknown), None, "a capital is meant");
+    assert_eq!(
+        home.finish("vboxm", &unknown),
+        Some("VBoxManage".to_owned())
+    );
+}
+
+#[test]
+fn directories_typed_in_lower_case_are_put_in_their_own() {
+    let tree = Tree::new();
+    let mut home = tree.look("home");
+    let unknown = |_: &str| 0.0;
+    assert_eq!(
+        home.finish("cd ~/dev/gith", &unknown),
+        Some("cd ~/Dev/GitHub/".to_owned())
+    );
+    assert_eq!(
+        home.finish("cd dev/gite", &unknown),
+        Some("cd Dev/gitea/".to_owned())
+    );
+    // GitHub and gitea are both "git" but for case: an exact fit first.
+    assert_eq!(
+        home.finish("cd dev/git", &unknown),
+        Some("cd Dev/gitea/".to_owned())
+    );
+    let mut look = tree.look("proj");
+    assert_eq!(
+        look.finish("vim SRC/ma", &unknown),
+        None,
+        "capitals typed that the name does not have"
     );
 }
 

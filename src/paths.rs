@@ -5,10 +5,19 @@
 //! Everything asked is remembered until the next prompt, when the directory
 //! may have changed and so may the files; nothing here is asked more than a
 //! few times for a keystroke.
+//!
+//! A name is finished from those that start with the word exactly, if any
+//! do, else from those that fit it with capitals for letters typed in lower
+//! case (see [`crate::text`]), and the word is then put in their case. So
+//! are the directories before it, when they are not there as typed but one
+//! is there that is the same but for case: "ls ~/dev/gi" becomes
+//! "ls ~/Dev/GitHub/".
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+
+use crate::text::{self, Start};
 
 /// The most paths whose existence is remembered at once.
 const MAX_REMEMBERED: usize = 512;
@@ -149,6 +158,33 @@ fn escaped(name: &str) -> Option<String> {
         out.push(c);
     }
     Some(out)
+}
+
+/// Of `items`, whose names are given by `name`, those that start with `word`
+/// exactly and are longer, if any are; else those that fit it with capitals
+/// for its lower case letters.
+fn fitting<'a, T: 'a>(
+    items: impl Iterator<Item = &'a T>,
+    word: &str,
+    name: impl Fn(&T) -> &str,
+) -> Vec<&'a T> {
+    let chars = word.chars().count();
+    let (mut exact, mut loose) = (Vec::new(), Vec::new());
+    for item in items {
+        let name = name(item);
+        if !text::longer(name, chars) {
+            continue;
+        }
+        match text::start(name, word) {
+            Start::Exact => exact.push(item),
+            Start::Loose if exact.is_empty() && loose.len() < MAX_ENTRIES => loose.push(item),
+            _ => {}
+        }
+        if exact.len() >= MAX_ENTRIES {
+            break;
+        }
+    }
+    if exact.is_empty() { loose } else { exact }
 }
 
 /// The longest start that every one of `names` has.
@@ -313,83 +349,137 @@ impl Look {
     /// What finishes the last word of `line` when the history has nothing
     /// for it: a program's name in a command's place, else a name in the
     /// directory the word points into. `worth` says what a program is worth
-    /// to this person. Returns the characters to add.
+    /// to this person. Returns the line with its last word finished, in the
+    /// case of the names it was finished with.
     pub fn finish(&mut self, line: &str, worth: &dyn Fn(&str) -> f64) -> Option<String> {
         let (word, command, in_place) = last_word(line)?;
-        if in_place {
-            return self.finish_program(word, worth);
-        }
-        let only_dirs = command.is_some_and(|c| TAKES_A_DIRECTORY.contains(&c));
-        self.finish_path(word, only_dirs)
+        let finished = if in_place {
+            self.finish_program(word, worth)?
+        } else {
+            let only_dirs = command.is_some_and(|c| TAKES_A_DIRECTORY.contains(&c));
+            self.finish_path(word, only_dirs)?
+        };
+        // The word is the end of the line.
+        let before = line.get(..line.len().checked_sub(word.len())?)?;
+        Some(format!("{before}{finished}"))
     }
 
+    /// The program's name that `word` finishes as, whole.
     fn finish_program(&mut self, word: &str, worth: &dyn Fn(&str) -> f64) -> Option<String> {
         if word.is_empty() || word.contains('/') {
             return None;
         }
         self.gather_programs();
-        let low = self.programs.partition_point(|name| name.as_str() < word);
-        let fits: Vec<&str> = self
+        let low = self
+            .programs
+            .partition_point(|name| text::fold_cmp(name, word).is_lt());
+        let run = self
             .programs
             .get(low..)
             .unwrap_or_default()
             .iter()
-            .take_while(|name| name.starts_with(word))
-            .map(String::as_str)
-            .filter(|name| *name != word)
-            .take(MAX_ENTRIES)
-            .collect();
+            .take_while(|name| text::starts_folded(name, word));
+        let fits = fitting(run, word, String::as_str);
         let best = fits
             .iter()
             .map(|name| (worth(name), *name))
             .filter(|(value, _)| *value > 0.0)
             .max_by(|a, b| a.0.total_cmp(&b.0))
-            .map(|(_, name)| name.to_owned());
+            .map(|(_, name)| name.clone());
         let chosen = best.or_else(|| match fits.as_slice() {
-            [only] => Some((*only).to_owned()),
-            _ => Some(common_start(fits.iter().copied())),
+            [only] => Some((*only).clone()),
+            _ => Some(common_start(fits.iter().map(|name| name.as_str()))),
         })?;
-        chosen
-            .strip_prefix(word)
-            .filter(|rest| !rest.is_empty())
-            .map(str::to_owned)
+        text::longer(&chosen, word.chars().count()).then_some(chosen)
     }
 
+    /// The path that `word` finishes as, whole, as it is typed.
     fn finish_path(&mut self, word: &str, only_dirs: bool) -> Option<String> {
-        let (dir_part, base) = word.rsplit_once('/').map_or(("", word), |(d, b)| (d, b));
-        let dir_word = if word.contains('/') {
-            if dir_part.is_empty() { "/" } else { dir_part }
-        } else {
-            "."
-        };
-        let dir = if word.starts_with('/') && dir_part.is_empty() {
-            PathBuf::from("/")
-        } else {
-            self.resolve(dir_word)?
-        };
+        let base = word.rsplit_once('/').map_or(word, |(_, base)| base);
+        let lead = word.get(..word.len().checked_sub(base.len())?)?;
+        let (dir, lead) = self.directory_of(lead)?;
         self.list(&dir);
         let entries = self.listed.get(&dir)?;
         let hidden = base.starts_with('.');
-        let fits: Vec<&Entry> = entries
+        let shown = entries
             .iter()
-            .filter(|e| e.name.starts_with(base) && e.name != base)
             .filter(|e| hidden || !e.name.starts_with('.'))
-            .filter(|e| !only_dirs || e.dir)
-            .collect();
+            .filter(|e| !only_dirs || e.dir);
+        let fits = fitting(shown, base, |e| e.name.as_str());
         let chosen = match fits.as_slice() {
             [] => return None,
             [only] => only.finished(),
             many => {
                 let common = common_start(many.iter().map(|e| e.name.as_str()));
-                if common.len() > base.len() {
+                if text::longer(&common, base.chars().count()) {
                     common
                 } else {
                     newest(&dir, many)?.finished()
                 }
             }
         };
-        let rest = chosen.strip_prefix(base)?;
-        escaped(rest).filter(|rest| !rest.is_empty())
+        let finished = format!("{lead}{}", escaped(&chosen)?);
+        text::longer(&finished, word.chars().count()).then_some(finished)
+    }
+
+    /// The directory that `lead`, a word up to its last slash, points into,
+    /// and `lead` with its names in their own case if they were not there
+    /// as typed.
+    fn directory_of(&mut self, lead: &str) -> Option<(PathBuf, String)> {
+        let Some(dir_word) = lead.strip_suffix('/') else {
+            return Some((self.resolve(".")?, String::new()));
+        };
+        if dir_word.is_empty() {
+            return Some((PathBuf::from("/"), lead.to_owned()));
+        }
+        let dir = self.resolve(dir_word)?;
+        if self.kind(dir.clone()) == Some(true) {
+            return Some((dir, lead.to_owned()));
+        }
+        let fixed = self.put_right(dir_word)?;
+        Some((self.resolve(&fixed)?, format!("{fixed}/")))
+    }
+
+    /// `dir`, a directory as typed, with each name in it that is not there
+    /// put in the case of the one directory beside it that is the same but
+    /// for that, as [`text::start`] has it; none if there is not just one.
+    fn put_right(&mut self, dir: &str) -> Option<String> {
+        let mut parts = dir.split('/');
+        let (mut at, mut fixed) = match parts.clone().next()? {
+            "" => (PathBuf::from("/"), Vec::from([String::new()])),
+            "~" => (self.home.clone()?, Vec::from(["~".to_owned()])),
+            first if first.starts_with('~') => return None,
+            _ => (self.cwd.clone(), Vec::new()),
+        };
+        if !fixed.is_empty() {
+            parts.next();
+        }
+        for part in parts.take(MAX_DEPTH) {
+            let as_typed =
+                matches!(part, "" | "." | "..") || self.kind(at.join(part)) == Some(true);
+            let name = if as_typed {
+                part.to_owned()
+            } else {
+                self.same_but_for_case(&at, part)?
+            };
+            at.push(&name);
+            fixed.push(name);
+        }
+        Some(fixed.join("/"))
+    }
+
+    /// The one directory in `dir` whose name is `part` but for capitals
+    /// where `part` has lower case letters.
+    fn same_but_for_case(&mut self, dir: &Path, part: &str) -> Option<String> {
+        self.list(dir);
+        let chars = part.chars().count();
+        let mut fits = self.listed.get(dir)?.iter().filter(|e| {
+            e.dir && !text::longer(&e.name, chars) && text::start(&e.name, part) != Start::No
+        });
+        match (fits.next(), fits.next()) {
+            (Some(one), None) => Some(one.name.clone()),
+            _ => None,
+        }
     }
 
     /// Read the entries of `dir`, once until the next prompt. What kind each
@@ -439,7 +529,7 @@ impl Look {
                 }
             }
         }
-        names.sort_unstable();
+        names.sort_unstable_by(|a, b| text::key_cmp(a, b));
         names.dedup();
         self.programs = names;
         self.programs_at = Some(Instant::now());

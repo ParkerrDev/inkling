@@ -80,7 +80,8 @@ fn share_of(len: usize, hundredths: usize) -> usize {
 }
 
 /// Weights from `spec`, `name=value` pairs split by commas, over the
-/// defaults: `fade`, `fade_here`, `project`, `directory`, `follows`, `failed`.
+/// defaults: `fade`, `fade_here`, `project`, `directory`, `follows`,
+/// `failed`, `case`.
 fn weights_from(spec: &str) -> Result<inkling::index::Weights> {
     let mut weights = inkling::index::Weights::default();
     for pair in spec.split(',').filter(|pair| !pair.is_empty()) {
@@ -90,6 +91,9 @@ fn weights_from(spec: &str) -> Result<inkling::index::Weights> {
         let value: f64 = value
             .parse()
             .with_context(|| format!("{value:?} is not a number"))?;
+        if !value.is_finite() || value < 0.0 {
+            bail!("{name} is {value}: a weight is a number, 0 or more");
+        }
         let slot = match name {
             "fade" => &mut weights.fade,
             "fade_here" => &mut weights.fade_here,
@@ -97,6 +101,7 @@ fn weights_from(spec: &str) -> Result<inkling::index::Weights> {
             "directory" => &mut weights.directory,
             "follows" => &mut weights.follows,
             "failed" => &mut weights.failed,
+            "case" => &mut weights.case,
             _ => bail!("no weight called {name:?}"),
         };
         *slot = value;
@@ -106,6 +111,7 @@ fn weights_from(spec: &str) -> Result<inkling::index::Weights> {
 
 fn replay(tune: bool, spec: Option<&str>) -> Result<i32> {
     use inkling::index::{Order, Weights};
+    use inkling::replay::{Typist, Way};
     let env = history::Env::from_process();
     let Some(source) = history::Source::discover(&env) else {
         bail!("no history found (neither Atuin's database nor the history file)");
@@ -130,23 +136,38 @@ fn replay(tune: bool, spec: Option<&str>) -> Result<i32> {
         out::line(format_args!("tuned: {weights:?}"))?;
     }
     let orders = [Order::Recent, Order::RecentHereFirst, Order::Likely];
-    let replayed = inkling::replay::replay(&past, weights, (learn, end), &orders, &mut look);
-    report(&replayed.orders, &replayed.knowing)?;
-    Ok(0)
-}
-
-fn report(scores: &[inkling::replay::Score], knowing: &inkling::replay::Score) -> Result<()> {
-    let names = [
-        "fish's order (most recent)",
-        "inkling before (recent, this directory first)",
-        "inkling (likely, by directory, project, sequence)",
-    ];
-    if let Some(first) = scores.first() {
+    let ways: Vec<Way> = [Typist::Exact, Typist::Lower]
+        .into_iter()
+        .flat_map(|typist| orders.map(|order| Way { order, typist }))
+        .collect();
+    let replayed = inkling::replay::replay(&past, weights, (learn, end), &ways, &mut look);
+    let (exact, lower) = replayed
+        .ways
+        .split_at(orders.len().min(replayed.ways.len()));
+    if let Some(first) = exact.first() {
         out::line(format_args!(
-            "learned the first {LEARN}%, then typed the rest: {} commands, {} characters\n",
+            "learned the first {LEARN}%, then typed the rest: {} commands, {} characters",
             first.commands, first.chars
         ))?;
     }
+    out::line(format_args!("\ntyped with every letter in its own case:\n"))?;
+    report(exact, Some(&replayed.knowing))?;
+    out::line(format_args!(
+        "\ntyped with every letter in lower case, the case left to the suggestion:\n"
+    ))?;
+    report(lower, None)?;
+    Ok(0)
+}
+
+fn report(
+    scores: &[inkling::replay::Score],
+    knowing: Option<&inkling::replay::Score>,
+) -> Result<()> {
+    let names = [
+        "fish's rule (most recent; as typed, else any case)",
+        "inkling's first rule (recent, this directory first)",
+        "inkling (likely, by directory, project, sequence)",
+    ];
     out::line(format_args!(
         "{:52} {:>7} {:>22}",
         "", "typing", "the very command after"
@@ -158,8 +179,8 @@ fn report(scores: &[inkling::replay::Score], knowing: &inkling::replay::Score) -
     let knowing_name = "knowing every command run before (the most)";
     for (name, score) in names
         .iter()
-        .chain([&knowing_name])
-        .zip(scores.iter().chain([knowing]))
+        .chain(knowing.map(|_| &knowing_name))
+        .zip(scores.iter().chain(knowing))
     {
         let per_cent = |share: f64| format!("{:.1}%", share * 100.0);
         out::line(format_args!(

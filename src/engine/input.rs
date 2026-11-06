@@ -7,6 +7,9 @@ use super::{
 use crate::keys::{self, Accept, Key, Token};
 use crate::text;
 
+/// The key readline deletes the character before the cursor with.
+const BACKSPACE: u8 = 0x7f;
+
 /// What one pass over the buffered keys settled.
 struct Pass<'a> {
     ctx: Ctx<'a>,
@@ -81,7 +84,7 @@ impl<S: Suggest> Engine<S> {
         }
         let mut pass = Pass {
             ctx: Ctx {
-                shown: shown.as_deref(),
+                shown: shown.as_ref(),
             },
             ready,
             batch: Batch::default(),
@@ -199,15 +202,17 @@ impl Prompt {
         Flow::Next
     }
 
-    /// Type the part of the suggestion `kind` takes, instead of the key.
+    /// Type the part of the suggestion `kind` takes, instead of the key:
+    /// first the line's case put right, if it needs that, then the part.
     fn take_suggestion(&mut self, kind: Accept, pass: &mut Pass<'_>) -> bool {
-        let Some(rest) = pass.ctx.shown else {
+        let Some(fix) = pass.ctx.shown else {
             return false;
         };
         let at_end = matches!(self.line, Line::Known { at_end: true, .. });
         if !at_end || self.quarantined() || self.in_paste {
             return false;
         }
+        let rest = fix.rest.as_str();
         let end = match kind {
             Accept::All => rest.len(),
             Accept::Word => text::word_end(rest),
@@ -217,8 +222,18 @@ impl Prompt {
         if part.is_empty() {
             return false;
         }
-        pass.out.to_shell.extend_from_slice(part.as_bytes());
-        self.ahead = self.ahead.take().and_then(|ahead| ahead.typed(part));
+        let shell = &mut pass.out.to_shell;
+        // Backspace, as readline has it bound: one character each.
+        shell.extend(std::iter::repeat_n(BACKSPACE, fix.erase));
+        shell.extend_from_slice(fix.retype.as_bytes());
+        shell.extend_from_slice(part.as_bytes());
+        let mut ahead = self.ahead.take();
+        for _ in 0..fix.erase {
+            ahead = ahead.and_then(Ahead::backspace);
+        }
+        self.ahead = ahead
+            .and_then(|ahead| ahead.typed(&fix.retype))
+            .and_then(|ahead| ahead.typed(part));
         self.line = Line::Unknown;
         true
     }
