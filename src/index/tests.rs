@@ -414,8 +414,11 @@ fn a_capital_typed_first_in_a_large_history_is_still_fast() {
         assert_eq!(index.suggest("C"), None);
     }
     let each = started.elapsed() / 100;
+    // Every one of the 100,000 is looked at: 0.16 ms in a release build
+    // here, and over 2 ms in a debug build on a slow CI runner.
+    let bound = if cfg!(debug_assertions) { 20 } else { 2 };
     assert!(
-        each < std::time::Duration::from_millis(2),
+        each < std::time::Duration::from_millis(bound),
         "{each:?} a lookup"
     );
 }
