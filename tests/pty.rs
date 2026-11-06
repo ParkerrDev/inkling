@@ -946,6 +946,11 @@ mod tests {
     /// suggest from, and then the keys that take a suggestion are left out,
     /// since those are meant to differ; without history they are tried.
     fn stays_in_step(with_history: bool, signals: bool, cut: Cut) {
+        // Tab completes from words of its own in both shells: what it would
+        // find on the search path differs from one machine to the next, and
+        // finding it there can take longer than a settle on a slow one.
+        const COMPLETIONS: &str = "complete -E -W 'alpha beta'; \
+            complete -I -W 'alpha alps beta'; complete -D -W 'xyz xyzzy'";
         let history = [
             "eab c",
             "git status",
@@ -967,8 +972,8 @@ mod tests {
                 plain_home.write_history(&history);
                 inkling_home.write_history(&history);
             }
-            let mut plain = plain_home.shell_with("", &[("INKLING", "0")]);
-            let mut wrapped = inkling_home.shell("");
+            let mut plain = plain_home.shell_with(COMPLETIONS, &[("INKLING", "0")]);
+            let mut wrapped = inkling_home.shell(COMPLETIONS);
             let mut so_far = Vec::new();
             for chunk in writes(&keys, seed, cut) {
                 plain.send(&chunk);
